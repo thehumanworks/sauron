@@ -1,0 +1,40 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging/build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Editor / IDE / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Testing and lint tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.coverage
+coverage.xml
+htmlcov/
+pytestdebug.log
+
+# Jujutsu metadata (local VCS workspace state)
+.jj/
+
+# Environment and local config
+.env
+.env.*
+!.env.example
