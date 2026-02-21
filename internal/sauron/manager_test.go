@@ -10,6 +10,7 @@ import (
 type fakeSandboxService struct {
 	startResult StartResult
 	startErr    error
+	startReq    StartSandboxRequest
 
 	stopErr error
 
@@ -22,8 +23,9 @@ type fakeSandboxService struct {
 	lastStopSandboxID string
 }
 
-func (f *fakeSandboxService) StartSandbox(_ context.Context, _ StartSandboxRequest) (*StartResult, error) {
+func (f *fakeSandboxService) StartSandbox(_ context.Context, req StartSandboxRequest) (*StartResult, error) {
 	f.startCalls++
+	f.startReq = req
 	if f.startErr != nil {
 		return nil, f.startErr
 	}
@@ -107,6 +109,21 @@ func TestManagerStartSavesState(t *testing.T) {
 	if service.startCalls != 1 {
 		t.Fatalf("expected one start call, got %d", service.startCalls)
 	}
+	if service.startReq.AppName != defaultAppName {
+		t.Fatalf("expected default app name %q, got %q", defaultAppName, service.startReq.AppName)
+	}
+	if service.startReq.Runtime != defaultRuntime {
+		t.Fatalf("expected default runtime %q, got %q", defaultRuntime, service.startReq.Runtime)
+	}
+	if service.startReq.RepoDir != defaultRepoDir {
+		t.Fatalf("expected default repo dir %q, got %q", defaultRepoDir, service.startReq.RepoDir)
+	}
+	if service.startReq.SecretName != "" {
+		t.Fatalf("expected empty default secret, got %q", service.startReq.SecretName)
+	}
+	if service.startReq.FromDotenv != "" {
+		t.Fatalf("expected empty default from dotenv, got %q", service.startReq.FromDotenv)
+	}
 	if store.state == nil {
 		t.Fatal("state was not saved")
 	}
@@ -118,6 +135,74 @@ func TestManagerStartSavesState(t *testing.T) {
 	}
 	if store.state.TimeoutSeconds != 3600 {
 		t.Fatalf("unexpected timeout seconds: %d", store.state.TimeoutSeconds)
+	}
+}
+
+func TestManagerStartForwardsExtendedStartOptions(t *testing.T) {
+	t.Parallel()
+
+	service := &fakeSandboxService{
+		startResult: StartResult{
+			SandboxID: "sb-opts",
+			BrowseURL: "https://sandbox.example",
+			Token:     "token-opts",
+		},
+	}
+	store := &memoryStateStore{}
+	manager := NewManager(service, store, Options{
+		AppName:     "custom-app",
+		ImageID:     "im-123",
+		Runtime:     "node22",
+		FromDotenv:  ".env",
+		Timeout:     45 * time.Minute,
+		IdleTimeout: 3 * time.Minute,
+		SecretName:  "github",
+		RepoURL:     "https://github.com/acme/private-repo.git",
+		RepoRef:     "main",
+		RepoDir:     "/workspace/src",
+		DevCommand:  "npm run dev",
+		DevPort:     5173,
+	})
+
+	if _, err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned unexpected error: %v", err)
+	}
+
+	if service.startReq.AppName != "custom-app" {
+		t.Fatalf("unexpected app name: %q", service.startReq.AppName)
+	}
+	if service.startReq.ImageID != "im-123" {
+		t.Fatalf("unexpected image id: %q", service.startReq.ImageID)
+	}
+	if service.startReq.Runtime != "node22" {
+		t.Fatalf("unexpected runtime: %q", service.startReq.Runtime)
+	}
+	if service.startReq.FromDotenv != ".env" {
+		t.Fatalf("unexpected from dotenv path: %q", service.startReq.FromDotenv)
+	}
+	if service.startReq.Timeout != 45*time.Minute {
+		t.Fatalf("unexpected timeout: %v", service.startReq.Timeout)
+	}
+	if service.startReq.IdleTimeout != 3*time.Minute {
+		t.Fatalf("unexpected idle timeout: %v", service.startReq.IdleTimeout)
+	}
+	if service.startReq.SecretName != "github" {
+		t.Fatalf("unexpected secret name: %q", service.startReq.SecretName)
+	}
+	if service.startReq.RepoURL != "https://github.com/acme/private-repo.git" {
+		t.Fatalf("unexpected repo url: %q", service.startReq.RepoURL)
+	}
+	if service.startReq.RepoRef != "main" {
+		t.Fatalf("unexpected repo ref: %q", service.startReq.RepoRef)
+	}
+	if service.startReq.RepoDir != "/workspace/src" {
+		t.Fatalf("unexpected repo dir: %q", service.startReq.RepoDir)
+	}
+	if service.startReq.DevCommand != "npm run dev" {
+		t.Fatalf("unexpected dev command: %q", service.startReq.DevCommand)
+	}
+	if service.startReq.DevPort != 5173 {
+		t.Fatalf("unexpected dev port: %d", service.startReq.DevPort)
 	}
 }
 

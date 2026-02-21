@@ -18,12 +18,18 @@ Use `wit` to ground implementation details before changing lifecycle code:
    - `wit sed -n '280,980p' modal-labs/libmodal modal-go/sandbox.go`
    - `wit sed -n '55,120p' modal-labs/libmodal modal-go/app.go`
    - `wit sed -n '170,235p' modal-labs/libmodal modal-go/image.go`
+   - `wit sed -n '1,180p' modal-labs/libmodal modal-go/secret.go`
    - `wit sed -n '1,120p' modal-labs/libmodal modal-go/doc.go`
 
 ## Sauron mapping
 - App lookup: `client.Apps.FromName(..., CreateIfMissing: true)`
 - Sandbox start: `client.Sandboxes.Create(...)` with chromium bootstrap command
-- Credentials: `sb.CreateConnectToken(...)`
+- Secret injection: `client.Secrets.FromName(...)` + `SandboxCreateParams.Secrets`
+- Dotenv injection: parse local `.env` and append `client.Secrets.FromMap(...)` result to `SandboxCreateParams.Secrets`
+- Direct CDP access: expose encrypted tunnel port `9222` via `SandboxCreateParams.H2Ports`, run Chromium debug on loopback (`127.0.0.1:9223`), and forward via `socat` (still no connect-token proxying)
+- Dev server tunnels: `SandboxCreateParams.H2Ports` + `sb.Tunnels(...)`
+- Credentials (legacy proxy mode only): `sb.CreateConnectToken(...)`
+- Browser WS discovery for Playwright/Puppeteer: `GET <cdp_tunnel_url>/json/version` with `Host: localhost` (Chromium rejects non-localhost host headers on devtools HTTP endpoints)
 - Stop: `sb.Terminate(...)`
 - Liveness check: `sb.Poll(...)` (nil exit code means still running)
 

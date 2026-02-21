@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import time
+from typing import Optional
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -9,17 +10,16 @@ from playwright.sync_api import sync_playwright
 
 
 def discover_cdp_ws_url(
-    cdp_proxy_url: str,
-    token: str,
+    cdp_url: str,
+    token: Optional[str] = None,
     retries: int = 5,
     retry_delay: float = 0.5,
 ) -> tuple[str, dict[str, str]]:
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Host": "localhost",
-    }
+    headers: dict[str, str] = {"Host": "localhost"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     last_error = None
-    base = cdp_proxy_url.rstrip("/")
+    base = cdp_url.rstrip("/")
     base_host = urlparse(base).netloc
     ws_scheme = "wss" if base.startswith("https://") else "ws"
 
@@ -51,7 +51,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument(
         "--token",
         default=os.getenv("SAURON_CONNECT_TOKEN"),
-        help="Modal sandbox connect token",
+        help="Optional CDP auth token (legacy proxy mode)",
     )
     parser.add_argument("--target", default="https://google.com", help="Page to load")
     parser.add_argument(
@@ -68,9 +68,9 @@ def get_args() -> argparse.Namespace:
 
 def main() -> None:
     args = get_args()
-    if not args.url or not args.token:
+    if not args.url:
         raise ValueError(
-            "Missing credentials: provide --url/--token or set BROWSE_URL/BROWSE_TOKEN"
+            "Missing URL: provide --url or set SAURON_URL"
         )
 
     cdp_ws_url, headers = discover_cdp_ws_url(

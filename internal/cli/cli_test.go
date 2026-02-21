@@ -235,11 +235,50 @@ func TestImageIDFlagScopedToStartCommandOnly(t *testing.T) {
 	if startCmd.Flags().Lookup("image-id") == nil {
 		t.Fatal("start command should expose --image-id")
 	}
+	if startCmd.Flags().Lookup("runtime") == nil {
+		t.Fatal("start command should expose --runtime")
+	}
+	if startCmd.Flags().Lookup("from-dotenv") == nil {
+		t.Fatal("start command should expose --from-dotenv")
+	}
+	if startCmd.Flags().Lookup("secret") == nil {
+		t.Fatal("start command should expose --secret")
+	}
+	if startCmd.Flags().Lookup("repo") == nil {
+		t.Fatal("start command should expose --repo")
+	}
+	if startCmd.Flags().Lookup("dev-cmd") == nil {
+		t.Fatal("start command should expose --dev-cmd")
+	}
 	if rootCmd.PersistentFlags().Lookup("image-id") != nil {
 		t.Fatal("root command should not expose --image-id as persistent flag")
 	}
+	if rootCmd.PersistentFlags().Lookup("repo") != nil {
+		t.Fatal("root command should not expose --repo as persistent flag")
+	}
+	if rootCmd.PersistentFlags().Lookup("from-dotenv") != nil {
+		t.Fatal("root command should not expose --from-dotenv as persistent flag")
+	}
 	if stopCmd.Flags().Lookup("image-id") != nil {
 		t.Fatal("stop command should not expose --image-id")
+	}
+	if stopCmd.Flags().Lookup("repo") != nil {
+		t.Fatal("stop command should not expose --repo")
+	}
+	if stopCmd.Flags().Lookup("from-dotenv") != nil {
+		t.Fatal("stop command should not expose --from-dotenv")
+	}
+}
+
+func TestStartCommandFromDotenvNoOptDefaultValue(t *testing.T) {
+	opts := &rootOptions{}
+	cmd := newStartCommand(opts)
+
+	if err := cmd.ParseFlags([]string{"--from-dotenv"}); err != nil {
+		t.Fatalf("failed to parse flags: %v", err)
+	}
+	if opts.fromDotenv != ".env" {
+		t.Fatalf("expected from-dotenv to default to .env, got %q", opts.fromDotenv)
 	}
 }
 
@@ -247,5 +286,33 @@ func TestStopCommandRequiresSandboxID(t *testing.T) {
 	cmd := newStopCommand(&rootOptions{})
 	if err := cmd.Args(cmd, []string{}); err == nil {
 		t.Fatal("expected argument validation error when sandbox ID is missing")
+	}
+}
+
+func TestStartCommandRejectsRefWithoutRepo(t *testing.T) {
+	cmd := newStartCommand(&rootOptions{
+		repoRef: "main",
+	})
+
+	err := cmd.RunE(cmd, nil)
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "--ref requires --repo") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestStartCommandRejectsReservedDevPort(t *testing.T) {
+	cmd := newStartCommand(&rootOptions{
+		devPort: cdpTunnelPort,
+	})
+
+	err := cmd.RunE(cmd, nil)
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "reserved for CDP tunnel") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

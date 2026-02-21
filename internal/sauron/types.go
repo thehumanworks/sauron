@@ -15,16 +15,29 @@ var (
 type StartSandboxRequest struct {
 	AppName      string
 	ImageID      string
+	Runtime      string
+	FromDotenv   string
 	Timeout      time.Duration
 	IdleTimeout  time.Duration
 	UserMetadata string
+	SecretName   string
+	RepoURL      string
+	RepoRef      string
+	RepoDir      string
+	DevCommand   string
+	DevPort      int
 }
 
 // StartResult contains the credentials needed to connect to Chromium over CDP.
 type StartResult struct {
-	SandboxID string `json:"sandbox_id"`
-	BrowseURL string `json:"browse_url"`
-	Token     string `json:"token"`
+	SandboxID      string            `json:"sandbox_id"`
+	BrowseURL      string            `json:"browse_url"`
+	Token          string            `json:"token"`
+	BrowserWSURL   string            `json:"browser_ws_url,omitempty"`
+	ConnectHeaders map[string]string `json:"connect_headers,omitempty"`
+	RepoPath       string            `json:"repo_path,omitempty"`
+	DevServerURL   string            `json:"dev_server_url,omitempty"`
+	DevServerPort  int               `json:"dev_server_port,omitempty"`
 }
 
 // SessionState tracks the active sandbox and timeout window for health checks.
@@ -47,8 +60,16 @@ type HealthStatus struct {
 type Options struct {
 	AppName     string
 	ImageID     string
+	Runtime     string
+	FromDotenv  string
 	Timeout     time.Duration
 	IdleTimeout time.Duration
+	SecretName  string
+	RepoURL     string
+	RepoRef     string
+	RepoDir     string
+	DevCommand  string
+	DevPort     int
 	Now         func() time.Time
 }
 

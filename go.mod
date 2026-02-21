@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/charmbracelet/glamour v0.10.0
+	github.com/joho/godotenv v1.5.1
 	github.com/modal-labs/libmodal/modal-go v0.6.3
 	github.com/spf13/cobra v1.10.2
 )

@@ -26,6 +26,14 @@ type rootOptions struct {
 	stateFile   string
 	appName     string
 	imageID     string
+	runtime     string
+	fromDotenv  string
+	secretName  string
+	repoURL     string
+	repoRef     string
+	repoDir     string
+	devCommand  string
+	devPort     int
 	timeout     time.Duration
 	idleTimeout time.Duration
 	verbose     bool
@@ -41,6 +49,9 @@ func newRootCommand() *cobra.Command {
 	opts := rootOptions{
 		stateFile:   defaultStateFile(),
 		appName:     "sauron",
+		runtime:     "node20",
+		secretName:  "",
+		repoDir:     "/workspace/repo",
 		timeout:     1 * time.Hour,
 		idleTimeout: 5 * time.Minute,
 	}
@@ -75,8 +86,16 @@ func newManager(opts *rootOptions) *sauron.Manager {
 	return sauron.NewManager(service, store, sauron.Options{
 		AppName:     opts.appName,
 		ImageID:     resolvedImageID(opts),
+		Runtime:     opts.runtime,
+		FromDotenv:  opts.fromDotenv,
 		Timeout:     opts.timeout,
 		IdleTimeout: opts.idleTimeout,
+		SecretName:  opts.secretName,
+		RepoURL:     opts.repoURL,
+		RepoRef:     opts.repoRef,
+		RepoDir:     opts.repoDir,
+		DevCommand:  opts.devCommand,
+		DevPort:     opts.devPort,
 	})
 }
 

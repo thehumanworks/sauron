@@ -8,6 +8,8 @@ import (
 
 const (
 	defaultAppName      = "sauron"
+	defaultRuntime      = "node20"
+	defaultRepoDir      = "/workspace/repo"
 	defaultTimeout      = 1 * time.Hour
 	defaultIdleTimeout  = 5 * time.Minute
 	defaultUserMetadata = `{"purpose":"sauron"}`
@@ -31,6 +33,12 @@ func NewManager(service SandboxService, store StateStore, options Options) *Mana
 	if options.AppName == "" {
 		options.AppName = defaultAppName
 	}
+	if options.Runtime == "" {
+		options.Runtime = defaultRuntime
+	}
+	if options.RepoDir == "" {
+		options.RepoDir = defaultRepoDir
+	}
 	if options.Now == nil {
 		options.Now = time.Now
 	}
@@ -47,9 +55,17 @@ func (m *Manager) Start(ctx context.Context) (*StartResult, error) {
 	result, err := m.service.StartSandbox(ctx, StartSandboxRequest{
 		AppName:      m.options.AppName,
 		ImageID:      m.options.ImageID,
+		Runtime:      m.options.Runtime,
+		FromDotenv:   m.options.FromDotenv,
 		Timeout:      m.options.Timeout,
 		IdleTimeout:  m.options.IdleTimeout,
 		UserMetadata: defaultUserMetadata,
+		SecretName:   m.options.SecretName,
+		RepoURL:      m.options.RepoURL,
+		RepoRef:      m.options.RepoRef,
+		RepoDir:      m.options.RepoDir,
+		DevCommand:   m.options.DevCommand,
+		DevPort:      m.options.DevPort,
 	})
 	if err != nil {
 		return nil, err
