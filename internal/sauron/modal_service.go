@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -273,6 +274,46 @@ func (s *ModalService) StopSandbox(ctx context.Context, sandboxID string) error 
 		return err
 	}
 	return nil
+}
+
+// ListSandboxes returns running sandboxes for a named Modal app.
+func (s *ModalService) ListSandboxes(ctx context.Context, appName string) ([]SandboxSummary, error) {
+	client, err := s.newClient()
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeClient(client)
+
+	app, err := client.Apps.FromName(ctx, appName, &modal.AppFromNameParams{
+		CreateIfMissing: false,
+	})
+	if err != nil {
+		if isModalNotFound(err) {
+			return []SandboxSummary{}, nil
+		}
+		return nil, err
+	}
+
+	sandboxIter, err := client.Sandboxes.List(ctx, &modal.SandboxListParams{AppID: app.AppID})
+	if err != nil {
+		return nil, err
+	}
+
+	sandboxes := make([]SandboxSummary, 0)
+	for sb, err := range sandboxIter {
+		if err != nil {
+			return nil, err
+		}
+		if sb == nil {
+			continue
+		}
+		sandboxes = append(sandboxes, SandboxSummary{SandboxID: sb.SandboxID})
+	}
+
+	sort.Slice(sandboxes, func(i, j int) bool {
+		return sandboxes[i].SandboxID < sandboxes[j].SandboxID
+	})
+	return sandboxes, nil
 }
 
 // SandboxRunning reports whether a sandbox is still running.

@@ -16,6 +16,7 @@ type managerAPI interface {
 	Start(ctx context.Context) (*sauron.StartResult, error)
 	Stop(ctx context.Context, sandboxID string) error
 	Health(ctx context.Context) (*sauron.HealthStatus, error)
+	List(ctx context.Context) ([]sauron.SandboxSummary, error)
 }
 
 var managerFactory = func(opts *rootOptions) managerAPI {
@@ -72,6 +73,7 @@ func newRootCommand() *cobra.Command {
 		newStartCommand(&opts),
 		newStopCommand(&opts),
 		newHealthCommand(&opts),
+		newListCommand(&opts),
 	)
 
 	return rootCmd

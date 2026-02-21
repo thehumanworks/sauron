@@ -23,6 +23,10 @@ type fakeManager struct {
 	health    *sauron.HealthStatus
 	healthErr error
 	healthCtx context.Context
+
+	list    []sauron.SandboxSummary
+	listErr error
+	listCtx context.Context
 }
 
 func (f *fakeManager) Start(ctx context.Context) (*sauron.StartResult, error) {
@@ -53,6 +57,16 @@ func (f *fakeManager) Health(ctx context.Context) (*sauron.HealthStatus, error) 
 	}
 	res := *f.health
 	return &res, nil
+}
+
+func (f *fakeManager) List(ctx context.Context) ([]sauron.SandboxSummary, error) {
+	f.listCtx = ctx
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := make([]sauron.SandboxSummary, len(f.list))
+	copy(out, f.list)
+	return out, nil
 }
 
 func TestStartCommandJSONUsesCommandContext(t *testing.T) {
@@ -152,6 +166,109 @@ func TestHealthCommandJSONOutput(t *testing.T) {
 	}
 	if !strings.Contains(got, `"remaining_seconds": 42`) {
 		t.Fatalf("missing remaining counter in output: %s", got)
+	}
+}
+
+func TestListCommandJSONOutput(t *testing.T) {
+	origFactory := managerFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+
+	fake := &fakeManager{
+		list: []sauron.SandboxSummary{
+			{SandboxID: "sb-list-1"},
+			{SandboxID: "sb-list-2"},
+		},
+	}
+	managerFactory = func(_ *rootOptions) managerAPI { return fake }
+
+	opts := &rootOptions{appName: "sauron", jsonOutput: true}
+	cmd := newListCommand(opts)
+
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	ctx := context.WithValue(context.Background(), "ctx-key", "ctx-value")
+	cmd.SetContext(ctx)
+
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("RunE returned error: %v", err)
+	}
+	if fake.listCtx != ctx {
+		t.Fatalf("expected manager to receive command context")
+	}
+
+	got := out.String()
+	if !strings.Contains(got, `"app_name": "sauron"`) {
+		t.Fatalf("missing app_name in output: %s", got)
+	}
+	if !strings.Contains(got, `"sandbox_id": "sb-list-1"`) {
+		t.Fatalf("missing first sandbox id in output: %s", got)
+	}
+	if !strings.Contains(got, `"sandbox_id": "sb-list-2"`) {
+		t.Fatalf("missing second sandbox id in output: %s", got)
+	}
+}
+
+func TestListCommandMarkdownOutputNoSandboxes(t *testing.T) {
+	origFactory := managerFactory
+	origRendererFactory := rendererFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+	t.Cleanup(func() { rendererFactory = origRendererFactory })
+
+	fake := &fakeManager{}
+	managerFactory = func(_ *rootOptions) managerAPI { return fake }
+	rendererFactory = func() (markdownRenderer, error) {
+		return nil, errors.New("renderer unavailable")
+	}
+
+	opts := &rootOptions{appName: "sauron"}
+	cmd := newListCommand(opts)
+
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("RunE returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "No running sandboxes found in Modal app `sauron`.") {
+		t.Fatalf("unexpected markdown output: %s", out.String())
+	}
+}
+
+func TestListCommandMarkdownOutputWithSandboxes(t *testing.T) {
+	origFactory := managerFactory
+	origRendererFactory := rendererFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+	t.Cleanup(func() { rendererFactory = origRendererFactory })
+
+	fake := &fakeManager{
+		list: []sauron.SandboxSummary{
+			{SandboxID: "sb-list-1"},
+			{SandboxID: "sb-list-2"},
+		},
+	}
+	managerFactory = func(_ *rootOptions) managerAPI { return fake }
+	rendererFactory = func() (markdownRenderer, error) {
+		return nil, errors.New("renderer unavailable")
+	}
+
+	opts := &rootOptions{appName: "sauron"}
+	cmd := newListCommand(opts)
+
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("RunE returned error: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "- Running sandboxes: `2`") {
+		t.Fatalf("missing sandbox count in output: %s", got)
+	}
+	if !strings.Contains(got, "- Sandbox ID: `sb-list-1`") {
+		t.Fatalf("missing first sandbox id in output: %s", got)
+	}
+	if !strings.Contains(got, "- Sandbox ID: `sb-list-2`") {
+		t.Fatalf("missing second sandbox id in output: %s", got)
 	}
 }
 

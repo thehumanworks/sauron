@@ -103,6 +103,11 @@ func (m *Manager) Stop(ctx context.Context, sandboxID string) error {
 	return nil
 }
 
+// List returns all running sandboxes in the configured app.
+func (m *Manager) List(ctx context.Context) ([]SandboxSummary, error) {
+	return m.service.ListSandboxes(ctx, m.options.AppName)
+}
+
 // Health checks whether the tracked sandbox is still alive and reports hard-timeout remaining.
 func (m *Manager) Health(ctx context.Context) (*HealthStatus, error) {
 	state, err := m.store.Load()

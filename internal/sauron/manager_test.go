@@ -17,8 +17,13 @@ type fakeSandboxService struct {
 	running    bool
 	runningErr error
 
+	listResult  []SandboxSummary
+	listErr     error
+	lastListApp string
+
 	startCalls int
 	stopCalls  int
+	listCalls  int
 
 	lastStopSandboxID string
 }
@@ -44,6 +49,17 @@ func (f *fakeSandboxService) SandboxRunning(_ context.Context, _ string) (bool, 
 		return false, f.runningErr
 	}
 	return f.running, nil
+}
+
+func (f *fakeSandboxService) ListSandboxes(_ context.Context, appName string) ([]SandboxSummary, error) {
+	f.listCalls++
+	f.lastListApp = appName
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := make([]SandboxSummary, len(f.listResult))
+	copy(out, f.listResult)
+	return out, nil
 }
 
 type memoryStateStore struct {
@@ -358,5 +374,41 @@ func TestManagerHealthNoState(t *testing.T) {
 	}
 	if health.Remaining != 0 {
 		t.Fatalf("expected zero remaining, got %v", health.Remaining)
+	}
+}
+
+func TestManagerListUsesConfiguredAppName(t *testing.T) {
+	t.Parallel()
+
+	service := &fakeSandboxService{
+		listResult: []SandboxSummary{
+			{SandboxID: "sb-list-1"},
+			{SandboxID: "sb-list-2"},
+		},
+	}
+	store := &memoryStateStore{}
+	manager := NewManager(service, store, Options{
+		AppName: "custom-app",
+		Timeout: 1 * time.Hour,
+	})
+
+	sandboxes, err := manager.List(context.Background())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+	if service.listCalls != 1 {
+		t.Fatalf("expected one list call, got %d", service.listCalls)
+	}
+	if service.lastListApp != "custom-app" {
+		t.Fatalf("expected list app custom-app, got %q", service.lastListApp)
+	}
+	if len(sandboxes) != 2 {
+		t.Fatalf("expected two sandboxes, got %d", len(sandboxes))
+	}
+	if sandboxes[0].SandboxID != "sb-list-1" {
+		t.Fatalf("unexpected first sandbox id: %q", sandboxes[0].SandboxID)
+	}
+	if sandboxes[1].SandboxID != "sb-list-2" {
+		t.Fatalf("unexpected second sandbox id: %q", sandboxes[1].SandboxID)
 	}
 }

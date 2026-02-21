@@ -32,6 +32,7 @@ Use `wit` to ground implementation details before changing lifecycle code:
 - Browser WS discovery for Playwright/Puppeteer: `GET <cdp_tunnel_url>/json/version` with `Host: localhost` (Chromium rejects non-localhost host headers on devtools HTTP endpoints)
 - Stop: `sb.Terminate(...)`
 - Liveness check: `sb.Poll(...)` (nil exit code means still running)
+- Running sandbox inventory by app: `client.Apps.FromName(..., CreateIfMissing: false)` then `client.Sandboxes.List(..., AppID: app.AppID)` (SDK list excludes finished sandboxes by default)
 
 ## External dependency
 - Go package: `github.com/modal-labs/libmodal/modal-go`

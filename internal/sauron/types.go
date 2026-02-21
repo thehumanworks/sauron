@@ -40,6 +40,11 @@ type StartResult struct {
 	DevServerPort  int               `json:"dev_server_port,omitempty"`
 }
 
+// SandboxSummary contains basic identifying data for a running sandbox.
+type SandboxSummary struct {
+	SandboxID string `json:"sandbox_id"`
+}
+
 // SessionState tracks the active sandbox and timeout window for health checks.
 type SessionState struct {
 	SandboxID      string    `json:"sandbox_id"`
@@ -78,6 +83,7 @@ type SandboxService interface {
 	StartSandbox(ctx context.Context, req StartSandboxRequest) (*StartResult, error)
 	StopSandbox(ctx context.Context, sandboxID string) error
 	SandboxRunning(ctx context.Context, sandboxID string) (bool, error)
+	ListSandboxes(ctx context.Context, appName string) ([]SandboxSummary, error)
 }
 
 // StateStore stores and retrieves local session state.
