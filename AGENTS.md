@@ -41,3 +41,6 @@ PRs should include:
 ## Security & Configuration Notes
 Do not commit runtime artifacts from `target/` or local session state under `~/.sauron/`.  
 Prefer environment variables for secrets/config (for example `SAURON_VALKEY_URL`) and avoid hardcoding credentials.
+
+## JJ Workspace Safety
+Before moving `main` to a workspace-derived change, verify ancestry and tree impact with `jj diff --from main --to <rev> --summary` to catch accidental whole-tree deletions from mis-rooted workspaces.
