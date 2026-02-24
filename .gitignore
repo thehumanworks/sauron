@@ -1,0 +1,64 @@
+# Rust build artifacts
+/target/
+/debug/
+/release/
+/tmp/
+/out/
+/target
+
+# Compiled artifacts
+**/*.rlib
+**/*.rmeta
+**/*.d
+**/*.dylib
+**/*.so
+**/*.a
+**/*.dll
+**/*.exe
+
+# Rust dependency and tool artifacts
+/Cargo.lock
+**/Cargo.lock
+/coverage/
+*.profraw
+*.profdata
+lcov.info
+/htmlcov/
+
+# Rust tool/cache directories
+.cargo/
+
+# macOS / Finder metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+._*
+Thumbs.db
+
+# Editor and shell artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+*.tmp
+
+# Environment / local configuration
+.env
+.env.*
+
+# Logs
+*.log
+
+# Temporary and cache directories
+.jj/
+.cache/
+node_modules/
+
+# Rust testing/build helpers
+target
+**/target

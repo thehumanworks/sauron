@@ -1,0 +1,151 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+// --- Output contract ---
+// Every browser command emits exactly one of these as JSON to stdout.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandResult<T>
+where
+    T: Serialize,
+{
+    pub ok: bool,
+    pub command: String,
+    pub data: T,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorEnvelope {
+    pub code: ErrorCode,
+    pub message: String,
+    pub hint: String,
+    pub recoverable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorResult {
+    pub ok: bool,
+    pub command: String,
+    pub error: ErrorEnvelope,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ResultEnvelope<T>
+where
+    T: Serialize,
+{
+    Ok(CommandResult<T>),
+    Err(ErrorResult),
+}
+
+// --- Snapshot types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotRef {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Stored for compatibility with the TS version (Puppeteer locator string).
+    /// The Rust version resolves refs via the accessibility tree and may ignore this field.
+    pub locator: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedRefState {
+    pub snapshot_id: u64,
+    pub url: String,
+    pub last_snapshot: String,
+    pub refs: HashMap<String, SnapshotRef>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotOptions {
+    pub interactive: bool,
+    pub clickable: bool,
+    pub scope: Option<String>,
+    pub include_iframes: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotResult {
+    pub tree: String,
+    pub refs: HashMap<String, SnapshotRef>,
+    pub url: String,
+    pub snapshot_id: u64,
+}
+
+// --- Error codes ---
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    // Navigation
+    NavTimeout,
+    NavNetwork,
+
+    // Element targeting
+    RefStale,
+    RefNotFound,
+    ElementNotFound,
+    ElementNotVisible,
+    ElementObscured,
+    ElementAmbiguous,
+    ElementNotInteractive,
+
+    // Control flow
+    Timeout,
+    WaitTimeout,
+
+    // Infrastructure
+    DaemonDown,
+    ChromeCrashed,
+
+    // Input
+    BadInput,
+
+    // Runtime session lifecycle
+    SessionRequired,
+    SessionInvalid,
+    SessionTerminated,
+    SessionConflict,
+
+    Unknown,
+}
+
+// --- Daemon types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PidFileData {
+    pub pid: u32,
+    pub port: u16,
+
+    /// Optional PID for an auxiliary Xvfb process (Linux only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xvfb_pid: Option<u32>,
+
+    /// DISPLAY used when running Chrome under Xvfb (e.g. ":99").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum DaemonStatus {
+    Running {
+        pid: Option<u32>,
+        port: u16,
+        ws_url: Option<String>,
+    },
+    Stopped,
+    Stale {
+        pid: Option<u32>,
+        port: Option<u16>,
+    },
+}
