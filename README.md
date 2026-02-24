@@ -11,7 +11,7 @@ This is a rewrite of the attached Bun/TypeScript `sauron` project as a compiled 
 - **Process-safe concurrency** with mandatory runtime sessions (`start` before browser commands)
 - **Per-session isolation** with generated `session_id`, `instance`, and `client` IDs by default
 - Optional runtime state backend in filesystem or Valkey
-- Uses Chrome **`--headless=new`** by default (or `--headed` with non-obstructive window flags)
+- Uses Chrome **`--headless=new`** by default (or `--headed` with non-obstructive launch flags; macOS uses windowless startup)
 
 ## Install
 

@@ -13,14 +13,15 @@ mod types;
 
 use base64::Engine as _;
 use browser::BrowserClient;
-use clap_complete::{generate, Shell};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 use context::AppContext;
 use errors::{make_error, make_success, print_result, CliError};
 use runtime::{
-    activate_session, cleanup_session_state, create_session_record, resolve_active_session,
-    resolve_project_root_path, session_required_error, terminate_session, RuntimeSessionRecord,
-    RuntimeStore, SessionStoreKind,
+    activate_session, cleanup_session_state, cleanup_stale_state, cleanup_stale_state_for_store,
+    create_session_record, resolve_active_session, resolve_project_root_path,
+    session_required_error, terminate_session, CleanupStats, RuntimeSessionRecord, RuntimeStore,
+    SessionStoreKind,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -88,7 +89,7 @@ struct Cli {
 enum Commands {
     /// Start a new runtime session and Chrome daemon
     Start {
-        /// Run Chrome headed (not headless).
+        /// Run Chrome headed (macOS uses windowless startup).
         ///
         /// Sauron will try to keep the window minimized/off-screen so it does not interrupt user flow.
         #[arg(long)]
@@ -116,7 +117,11 @@ enum Commands {
 
     /// Terminate the active runtime session and clean up state
     #[command(alias = "stop")]
-    Terminate,
+    Terminate {
+        /// After stopping, remove all stale instances, dead sessions, and orphaned state.
+        #[arg(long)]
+        cleanup: bool,
+    },
 
     /// Show Chrome daemon status
     Status,
@@ -186,7 +191,6 @@ enum Commands {
         #[arg(long)]
         screenshot_path: Option<PathBuf>,
     },
-
 
     /// Click an element by ref (@e1) or text
     Click {
@@ -280,7 +284,6 @@ enum Commands {
         #[arg(long, value_enum)]
         shell: CompletionShell,
     },
-
 }
 
 #[derive(Subcommand, Debug)]
@@ -304,7 +307,6 @@ enum CompletionShell {
     Bash,
     Zsh,
 }
-
 
 #[derive(Clone)]
 struct ActiveRuntime {
@@ -388,7 +390,7 @@ fn ensure_runtime_or_exit(
 fn command_label(command: &Commands) -> &'static str {
     match command {
         Commands::Start { .. } => "start",
-        Commands::Terminate => "terminate",
+        Commands::Terminate { .. } => "terminate",
         Commands::Status => "status",
         Commands::Navigate { .. } => "navigate",
         Commands::Snapshot { .. } => "snapshot",
@@ -410,6 +412,77 @@ fn command_label(command: &Commands) -> &'static str {
     }
 }
 
+fn should_fallback_to_cleanup_without_runtime(
+    error_code: types::ErrorCode,
+    explicit_session_id: bool,
+) -> bool {
+    matches!(error_code, types::ErrorCode::SessionRequired)
+        || (!explicit_session_id
+            && matches!(
+                error_code,
+                types::ErrorCode::SessionInvalid
+                    | types::ErrorCode::SessionTerminated
+                    | types::ErrorCode::BadInput
+            ))
+}
+
+fn cleanup_stats_json(stats: CleanupStats) -> serde_json::Value {
+    json!({
+        "instances": stats.instances,
+        "sessions": stats.sessions,
+        "logs": stats.logs
+    })
+}
+
+fn print_cleanup_summary(stats: CleanupStats) {
+    if stats.instances == 0 && stats.sessions == 0 && stats.logs == 0 {
+        eprintln!("Cleanup: nothing to clean up");
+        return;
+    }
+
+    eprintln!(
+        "Cleanup: removed {} stale instances, {} orphaned sessions, {} log files",
+        stats.instances, stats.sessions, stats.logs
+    );
+}
+
+fn run_cleanup(
+    base_dir: &std::path::Path,
+    store_kind: SessionStoreKind,
+) -> Result<CleanupStats, CliError> {
+    if store_kind == SessionStoreKind::Filesystem {
+        return cleanup_stale_state(base_dir);
+    }
+    cleanup_stale_state_for_store(base_dir, store_kind)
+}
+
+fn cleanup_terminate_log_artifacts(runtime: &ActiveRuntime) -> usize {
+    if runtime.store.kind() != SessionStoreKind::Filesystem {
+        return 0;
+    }
+
+    let logs_dir = runtime.ctx.base_dir.join("runtime").join("logs");
+    let session_id = runtime.session.session_id.as_str();
+    let mut removed = 0usize;
+
+    for extension in ["ndjson", "lock"] {
+        let path = logs_dir.join(format!("{}.{}", session_id, extension));
+        match std::fs::remove_file(&path) {
+            Ok(_) => removed = removed.saturating_add(1),
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "Cleanup warning: Failed to remove log artifact {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    removed
+}
 
 #[tokio::main]
 async fn main() {
@@ -443,7 +516,12 @@ async fn main() {
     let timeout_flag = cli.timeout;
 
     match command {
-        Commands::Start { headed, webgl, xvfb, enable_gpu } => {
+        Commands::Start {
+            headed,
+            webgl,
+            xvfb,
+            enable_gpu,
+        } => {
             let session = match create_session_record(
                 &store,
                 cli.session_id.clone(),
@@ -554,9 +632,51 @@ async fn main() {
             }
         }
 
-        Commands::Terminate => {
-            let mut runtime =
-                ensure_runtime_or_exit(&store, cli.session_id.clone(), "terminate", false);
+        Commands::Terminate { cleanup } => {
+            let requested_session_id = cli.session_id.clone();
+            let explicit_session_id = requested_session_id.is_some();
+            let runtime = if cleanup {
+                match require_runtime(&store, requested_session_id.clone()) {
+                    Ok(runtime) => Some(runtime),
+                    Err(e) => {
+                        if should_fallback_to_cleanup_without_runtime(e.code, explicit_session_id) {
+                            None
+                        } else {
+                            eprintln!("{}", e.message);
+                            std::process::exit(e.exit_code);
+                        }
+                    }
+                }
+            } else {
+                Some(ensure_runtime_or_exit(
+                    &store,
+                    requested_session_id,
+                    "terminate",
+                    false,
+                ))
+            };
+
+            let Some(mut runtime) = runtime else {
+                let base_dir = match context::resolve_base_dir() {
+                    Ok(base_dir) => base_dir,
+                    Err(e) => {
+                        eprintln!("{}", e.message);
+                        std::process::exit(e.exit_code);
+                    }
+                };
+                match run_cleanup(&base_dir, store.kind()) {
+                    Ok(stats) => {
+                        print_cleanup_summary(stats);
+                        println!("No active runtime session found. Cleanup completed.");
+                    }
+                    Err(e) => {
+                        eprintln!("{}", e.message);
+                        std::process::exit(e.exit_code);
+                    }
+                }
+                return;
+            };
+
             if let Err(e) = begin_runtime_command(&mut runtime, "terminate") {
                 eprintln!("{}", e.message);
                 std::process::exit(e.exit_code);
@@ -620,13 +740,33 @@ async fn main() {
                 }
             }
 
+            let mut cleanup_stats = None;
+            if cleanup {
+                match run_cleanup(&runtime.ctx.base_dir, runtime.store.kind()) {
+                    Ok(stats) => {
+                        cleanup_stats = Some(stats);
+                    }
+                    Err(e) => {
+                        terminate_errors.push(e.message);
+                        terminate_exit_code = e.exit_code;
+                    }
+                }
+            }
+
             if !terminate_errors.is_empty() {
-                finish_runtime_command(
-                    &runtime,
-                    "terminate",
-                    false,
-                    json!({ "errors": terminate_errors }),
-                );
+                let mut details = json!({ "errors": terminate_errors.clone() });
+                if let Some(stats) = cleanup_stats {
+                    details["cleanup"] = cleanup_stats_json(stats);
+                }
+                finish_runtime_command(&runtime, "terminate", false, details);
+                if let Some(mut stats) = cleanup_stats {
+                    if cleanup {
+                        stats.logs = stats
+                            .logs
+                            .saturating_add(cleanup_terminate_log_artifacts(&runtime));
+                    }
+                    print_cleanup_summary(stats);
+                }
                 eprintln!("Terminate completed with errors:");
                 for message in terminate_errors {
                     eprintln!("- {}", message);
@@ -634,19 +774,25 @@ async fn main() {
                 std::process::exit(terminate_exit_code);
             }
 
-            finish_runtime_command(
-                &runtime,
-                "terminate",
-                true,
-                json!({ "daemonStopped": stopped }),
-            );
+            let mut details = json!({ "daemonStopped": stopped });
+            if let Some(stats) = cleanup_stats {
+                details["cleanup"] = cleanup_stats_json(stats);
+            }
+            finish_runtime_command(&runtime, "terminate", true, details);
+            if let Some(mut stats) = cleanup_stats {
+                if cleanup {
+                    stats.logs = stats
+                        .logs
+                        .saturating_add(cleanup_terminate_log_artifacts(&runtime));
+                }
+                print_cleanup_summary(stats);
+            }
             if stopped {
                 println!("Runtime session terminated and Chrome daemon stopped.");
             } else {
                 println!("Runtime session terminated. No Chrome daemon was running.");
             }
         }
-
 
         Commands::Completions { shell } => {
             // Note: handled earlier before runtime store initialization, but kept here for completeness.
@@ -670,7 +816,7 @@ async fn main() {
             let ctx = runtime.ctx.clone();
 
             match command {
-                Commands::Start { .. } | Commands::Terminate => unreachable!(),
+                Commands::Start { .. } | Commands::Terminate { .. } => unreachable!(),
                 Commands::Completions { .. } => unreachable!(),
                 Commands::Status => {
                     if let Err(e) = begin_runtime_command(&mut runtime, "status") {
@@ -886,7 +1032,8 @@ async fn main() {
                                 if !screenshot {
                                     return Ok::<Option<serde_json::Value>, CliError>(None);
                                 }
-                                let data = page_for_screenshot.capture_screenshot(full_page).await?;
+                                let data =
+                                    page_for_screenshot.capture_screenshot(full_page).await?;
                                 if let Some(p) = screenshot_path_for_task {
                                     let bytes = base64::engine::general_purpose::STANDARD
                                         .decode(&data)
@@ -982,8 +1129,9 @@ async fn main() {
                                 }
                             };
 
-                            let any_success =
-                                snapshot_out.is_some() || screenshot_out.is_some() || content_out.is_some();
+                            let any_success = snapshot_out.is_some()
+                                || screenshot_out.is_some()
+                                || content_out.is_some();
 
                             if !any_success {
                                 if let Some(e) = first_error {
@@ -1331,8 +1479,8 @@ async fn main() {
                                         .into_iter()
                                         .filter(|t| t.target_type == "page")
                                         .map(|t| {
-                                            let bound =
-                                                bound_target_id.as_deref() == Some(t.target_id.as_str());
+                                            let bound = bound_target_id.as_deref()
+                                                == Some(t.target_id.as_str());
                                             json!({
                                                 "targetId": t.target_id,
                                                 "url": t.url,
@@ -1377,7 +1525,11 @@ async fn main() {
                                         .collect();
                                     if index >= pages.len() {
                                         return Err(CliError::bad_input(
-                                            format!("Tab index {} out of range ({} tabs)", index, pages.len()),
+                                            format!(
+                                                "Tab index {} out of range ({} tabs)",
+                                                index,
+                                                pages.len()
+                                            ),
                                             "Run `sauron tab list` and choose a valid index",
                                         ));
                                     }
@@ -1404,25 +1556,29 @@ async fn main() {
                                         .collect();
                                     if index >= pages.len() {
                                         return Err(CliError::bad_input(
-                                            format!("Tab index {} out of range ({} tabs)", index, pages.len()),
+                                            format!(
+                                                "Tab index {} out of range ({} tabs)",
+                                                index,
+                                                pages.len()
+                                            ),
                                             "Run `sauron tab list` and choose a valid index",
                                         ));
                                     }
 
                                     let target_id = pages[index].target_id.clone();
                                     let bound_target_id = browser::get_bound_target_id(&cmd_ctx)?;
-                                    let was_bound = bound_target_id.as_deref() == Some(target_id.as_str());
+                                    let was_bound =
+                                        bound_target_id.as_deref() == Some(target_id.as_str());
 
                                     browser.close_target(&target_id).await?;
 
                                     let mut new_bound: Option<String> = None;
                                     if was_bound {
                                         let remaining = browser.get_targets().await?;
-                                        let remaining: Vec<_> =
-                                            remaining
-                                                .into_iter()
-                                                .filter(|t| t.target_type == "page")
-                                                .collect();
+                                        let remaining: Vec<_> = remaining
+                                            .into_iter()
+                                            .filter(|t| t.target_type == "page")
+                                            .collect();
 
                                         if let Some(t) = remaining
                                             .iter()
@@ -1635,5 +1791,42 @@ async fn with_browser_only_command<F, Fut, T>(
             print_result(&res);
             std::process::exit(e.exit_code);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_fallback_allows_missing_runtime() {
+        assert!(should_fallback_to_cleanup_without_runtime(
+            types::ErrorCode::SessionRequired,
+            false,
+        ));
+    }
+
+    #[test]
+    fn cleanup_fallback_allows_implicit_bad_input() {
+        assert!(should_fallback_to_cleanup_without_runtime(
+            types::ErrorCode::BadInput,
+            false,
+        ));
+    }
+
+    #[test]
+    fn cleanup_fallback_allows_implicit_invalid_session() {
+        assert!(should_fallback_to_cleanup_without_runtime(
+            types::ErrorCode::SessionInvalid,
+            false,
+        ));
+    }
+
+    #[test]
+    fn cleanup_fallback_rejects_explicit_bad_input() {
+        assert!(!should_fallback_to_cleanup_without_runtime(
+            types::ErrorCode::BadInput,
+            true,
+        ));
     }
 }

@@ -22,7 +22,6 @@ pub struct ChromeLaunchOptions {
     pub xvfb: bool,
 }
 
-
 pub async fn get_ws_url(port: u16) -> Result<String, CliError> {
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
@@ -66,7 +65,7 @@ pub async fn is_running(port: u16) -> bool {
 }
 
 #[cfg(unix)]
-fn is_process_alive(pid: u32) -> bool {
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     kill(Pid::from_raw(pid as i32), None).is_ok()
@@ -81,7 +80,7 @@ fn send_signal(pid: u32, sig: nix::sys::signal::Signal) -> Result<(), CliError> 
 }
 
 #[cfg(windows)]
-fn is_process_alive(pid: u32) -> bool {
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -180,16 +179,30 @@ pub fn find_chrome_binary() -> String {
     }
 }
 
-pub fn build_chrome_args(port: u16, user_data_dir: &Path, opts: ChromeLaunchOptions) -> Vec<String> {
+pub fn build_chrome_args(
+    port: u16,
+    user_data_dir: &Path,
+    opts: ChromeLaunchOptions,
+) -> Vec<String> {
     let mut args = Vec::new();
 
     if opts.headless {
         args.push("--headless=new".to_string());
     } else {
-        // Best-effort: keep the window from interrupting user flow.
-        args.push("--window-size=1,1".to_string());
-        args.push("--window-position=-32000,-32000".to_string());
-        args.push("--start-minimized".to_string());
+        #[cfg(target_os = "macos")]
+        {
+            // Launch windowless on macOS to avoid focus steals/window flashes.
+            args.push("--no-startup-window".to_string());
+            args.push("--silent-launch".to_string());
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Best-effort: keep the window from interrupting user flow.
+            args.push("--window-size=1,1".to_string());
+            args.push("--window-position=-32000,-32000".to_string());
+            args.push("--start-minimized".to_string());
+        }
     }
 
     if opts.disable_gpu {
@@ -204,7 +217,6 @@ pub fn build_chrome_args(port: u16, user_data_dir: &Path, opts: ChromeLaunchOpti
         args.push("--use-angle=swiftshader".to_string());
         args.push("--enable-unsafe-swiftshader".to_string());
     }
-
 
     args.push(format!("--remote-debugging-port={}", port));
     args.push(format!("--user-data-dir={}", user_data_dir.display()));
@@ -321,7 +333,6 @@ pub async fn start(
     if launch_opts.xvfb {
         launch_opts.headless = false;
     }
-
 
     // Choose port.
     let port = if let Some(p) = port_flag {
@@ -606,4 +617,60 @@ pub async fn stop(
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn launch_opts(headless: bool) -> ChromeLaunchOptions {
+        ChromeLaunchOptions {
+            headless,
+            disable_gpu: true,
+            webgl: false,
+            xvfb: false,
+        }
+    }
+
+    #[test]
+    fn build_chrome_args_headless_includes_headless_flag() {
+        let args = build_chrome_args(
+            9222,
+            Path::new("/tmp/sauron-test-profile"),
+            launch_opts(true),
+        );
+
+        assert!(args.iter().any(|arg| arg == "--headless=new"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_chrome_args_headed_macos_uses_windowless_startup() {
+        let args = build_chrome_args(
+            9222,
+            Path::new("/tmp/sauron-test-profile"),
+            launch_opts(false),
+        );
+
+        assert!(args.iter().any(|arg| arg == "--no-startup-window"));
+        assert!(args.iter().any(|arg| arg == "--silent-launch"));
+        assert!(!args.iter().any(|arg| arg == "--start-minimized"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn build_chrome_args_headed_non_macos_uses_window_management_flags() {
+        let args = build_chrome_args(
+            9222,
+            Path::new("/tmp/sauron-test-profile"),
+            launch_opts(false),
+        );
+
+        assert!(args.iter().any(|arg| arg == "--window-size=1,1"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--window-position=-32000,-32000"));
+        assert!(args.iter().any(|arg| arg == "--start-minimized"));
+        assert!(!args.iter().any(|arg| arg == "--no-startup-window"));
+    }
 }

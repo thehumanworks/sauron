@@ -1,6 +1,7 @@
 use crate::context::{atomic_write, resolve_base_dir, FileLock};
+use crate::daemon;
 use crate::errors::CliError;
-use crate::types::ErrorCode;
+use crate::types::{ErrorCode, PidFileData};
 use clap::ValueEnum;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1378,6 +1379,497 @@ pub fn session_required_error(command_name: &str) -> CliError {
     )
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupStats {
+    pub instances: usize,
+    pub sessions: usize,
+    pub logs: usize,
+}
+
+struct StaleSessionCandidate {
+    path: PathBuf,
+    session_id: Option<String>,
+}
+
+struct SessionCleanupPlan {
+    active_instances: HashSet<String>,
+    stale_sessions: Vec<StaleSessionCandidate>,
+}
+
+fn cleanup_warning(message: String) {
+    eprintln!("Cleanup warning: {}", message);
+}
+
+fn session_pid_path_for_cleanup(base_dir: &Path, session: &RuntimeSessionRecord) -> PathBuf {
+    session.pid_path.clone().unwrap_or_else(|| {
+        base_dir
+            .join("instances")
+            .join(&session.instance)
+            .join("chrome.pid")
+    })
+}
+
+fn session_has_live_pid_for_cleanup(base_dir: &Path, session: &RuntimeSessionRecord) -> bool {
+    let pid_path = session_pid_path_for_cleanup(base_dir, session);
+    let text = match fs::read_to_string(&pid_path) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    let pid_data = match serde_json::from_str::<PidFileData>(&text) {
+        Ok(pid_data) => pid_data,
+        Err(_) => return false,
+    };
+    daemon::is_process_alive(pid_data.pid)
+}
+
+fn is_stale_session_for_cleanup(base_dir: &Path, session: &RuntimeSessionRecord) -> bool {
+    if session.state != RuntimeSessionState::Active {
+        return true;
+    }
+
+    let instance_dir = base_dir.join("instances").join(&session.instance);
+    if !instance_dir.exists() {
+        return true;
+    }
+
+    !session_has_live_pid_for_cleanup(base_dir, session)
+}
+
+fn derive_session_id_from_file(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string())
+}
+
+fn build_session_cleanup_plan(base_dir: &Path) -> SessionCleanupPlan {
+    let sessions_dir = base_dir.join("runtime").join("sessions");
+    let entries = match fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                cleanup_warning(format!(
+                    "Failed to read session directory {}: {}",
+                    sessions_dir.display(),
+                    e
+                ));
+            }
+            return SessionCleanupPlan {
+                active_instances: HashSet::new(),
+                stale_sessions: Vec::new(),
+            };
+        }
+    };
+
+    let mut active_instances = HashSet::new();
+    let mut stale_sessions = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                cleanup_warning(format!("Failed to read session entry: {}", e));
+                continue;
+            }
+        };
+        let path = entry.path();
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                cleanup_warning(format!(
+                    "Failed to inspect session entry {}: {}",
+                    path.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                cleanup_warning(format!(
+                    "Failed to read session file {}: {}",
+                    path.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+
+        let session = match serde_json::from_str::<RuntimeSessionRecord>(&text) {
+            Ok(session) => session,
+            Err(e) => {
+                let session_id = derive_session_id_from_file(&path);
+                cleanup_warning(format!(
+                    "Failed to parse session file {}: {}; removing as stale",
+                    path.display(),
+                    e
+                ));
+                stale_sessions.push(StaleSessionCandidate { path, session_id });
+                continue;
+            }
+        };
+
+        if is_stale_session_for_cleanup(base_dir, &session) {
+            stale_sessions.push(StaleSessionCandidate {
+                path,
+                session_id: Some(session.session_id),
+            });
+            continue;
+        }
+
+        active_instances.insert(session.instance);
+    }
+
+    SessionCleanupPlan {
+        active_instances,
+        stale_sessions,
+    }
+}
+
+fn remove_file_if_exists(path: &Path, what: &str) -> bool {
+    match fs::remove_file(path) {
+        Ok(_) => true,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                cleanup_warning(format!(
+                    "Failed to remove {} {}: {}",
+                    what,
+                    path.display(),
+                    e
+                ));
+            }
+            false
+        }
+    }
+}
+
+fn cleanup_orphaned_instances(
+    base_dir: &Path,
+    active_instances: &HashSet<String>,
+    remove_orphaned_dirs: bool,
+) -> usize {
+    let instances_dir = base_dir.join("instances");
+    let entries = match fs::read_dir(&instances_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                cleanup_warning(format!(
+                    "Failed to read instances directory {}: {}",
+                    instances_dir.display(),
+                    e
+                ));
+            }
+            return 0;
+        }
+    };
+
+    let mut removed = 0usize;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                cleanup_warning(format!("Failed to read instance entry: {}", e));
+                continue;
+            }
+        };
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                cleanup_warning(format!(
+                    "Failed to inspect instance entry {}: {}",
+                    entry.path().display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let instance_dir = entry.path();
+        let instance_id = entry.file_name().to_string_lossy().to_string();
+        let pid_path = instance_dir.join("chrome.pid");
+        let mut has_live_process = false;
+        let mut remove_pid_file = false;
+
+        match fs::read_to_string(&pid_path) {
+            Ok(text) => match serde_json::from_str::<PidFileData>(&text) {
+                Ok(pid_data) => {
+                    if daemon::is_process_alive(pid_data.pid) {
+                        has_live_process = true;
+                    } else {
+                        remove_pid_file = true;
+                    }
+                }
+                Err(_) => {
+                    remove_pid_file = true;
+                }
+            },
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    cleanup_warning(format!(
+                        "Failed to read pid file {}: {}",
+                        pid_path.display(),
+                        e
+                    ));
+                }
+            }
+        }
+
+        if remove_pid_file {
+            let _ = remove_file_if_exists(&pid_path, "stale pid file");
+        }
+
+        if has_live_process || active_instances.contains(instance_id.as_str()) {
+            continue;
+        }
+        if !remove_orphaned_dirs {
+            continue;
+        }
+
+        match fs::remove_dir_all(&instance_dir) {
+            Ok(_) => removed = removed.saturating_add(1),
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    cleanup_warning(format!(
+                        "Failed to remove orphaned instance directory {}: {}",
+                        instance_dir.display(),
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
+    removed
+}
+
+fn remove_matching_bindings(dir: &Path, session_id: &str) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                cleanup_warning(format!(
+                    "Failed to read bindings directory {}: {}",
+                    dir.display(),
+                    e
+                ));
+            }
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                cleanup_warning(format!("Failed to read binding entry: {}", e));
+                continue;
+            }
+        };
+        let path = entry.path();
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                cleanup_warning(format!(
+                    "Failed to inspect binding entry {}: {}",
+                    path.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    cleanup_warning(format!(
+                        "Failed to read binding file {}: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+                continue;
+            }
+        };
+
+        if text.trim() == session_id {
+            let _ = remove_file_if_exists(&path, "binding file");
+        }
+    }
+}
+
+fn remove_session_bindings(base_dir: &Path, session_id: &str) {
+    let runtime_dir = base_dir.join("runtime");
+    let binding_index_path = runtime_dir
+        .join("session-bindings")
+        .join(format!("{}.json", session_id));
+    let _ = remove_file_if_exists(&binding_index_path, "session binding index");
+
+    remove_matching_bindings(&runtime_dir.join("ppid"), session_id);
+    remove_matching_bindings(&runtime_dir.join("project"), session_id);
+}
+
+fn remove_stale_sessions(base_dir: &Path, stale_sessions: Vec<StaleSessionCandidate>) -> usize {
+    let mut removed = 0usize;
+
+    for stale in stale_sessions {
+        let removed_file = remove_file_if_exists(&stale.path, "stale session file");
+        if let Some(session_id) = stale.session_id.as_deref() {
+            remove_session_bindings(base_dir, session_id);
+        }
+        if removed_file {
+            removed = removed.saturating_add(1);
+        }
+    }
+
+    removed
+}
+
+fn load_existing_session_ids(base_dir: &Path) -> Option<HashSet<String>> {
+    let sessions_dir = base_dir.join("runtime").join("sessions");
+    let entries = match fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Some(HashSet::new());
+            }
+            cleanup_warning(format!(
+                "Failed to read sessions directory {}: {}",
+                sessions_dir.display(),
+                e
+            ));
+            return None;
+        }
+    };
+
+    let mut session_ids = HashSet::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                cleanup_warning(format!("Failed to read session entry: {}", e));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(session_id) = derive_session_id_from_file(&path) {
+            session_ids.insert(session_id);
+        }
+    }
+    Some(session_ids)
+}
+
+fn cleanup_orphaned_logs(base_dir: &Path) -> usize {
+    let Some(session_ids) = load_existing_session_ids(base_dir) else {
+        return 0;
+    };
+
+    let logs_dir = base_dir.join("runtime").join("logs");
+    let entries = match fs::read_dir(&logs_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                cleanup_warning(format!(
+                    "Failed to read log directory {}: {}",
+                    logs_dir.display(),
+                    e
+                ));
+            }
+            return 0;
+        }
+    };
+
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                cleanup_warning(format!("Failed to read log entry: {}", e));
+                continue;
+            }
+        };
+        let path = entry.path();
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                cleanup_warning(format!(
+                    "Failed to inspect log entry {}: {}",
+                    path.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let extension = path.extension().and_then(|ext| ext.to_str());
+        if extension != Some("ndjson") && extension != Some("lock") {
+            continue;
+        }
+
+        let Some(session_id) = derive_session_id_from_file(&path) else {
+            continue;
+        };
+        if session_ids.contains(session_id.as_str()) {
+            continue;
+        }
+
+        if remove_file_if_exists(&path, "orphaned log file") {
+            removed = removed.saturating_add(1);
+        }
+    }
+
+    removed
+}
+
+pub fn cleanup_stale_state_for_store(
+    base_dir: &Path,
+    store_kind: SessionStoreKind,
+) -> Result<CleanupStats, CliError> {
+    let mut stats = CleanupStats::default();
+    let session_plan = build_session_cleanup_plan(base_dir);
+
+    stats.instances = cleanup_orphaned_instances(
+        base_dir,
+        &session_plan.active_instances,
+        store_kind == SessionStoreKind::Filesystem,
+    );
+    stats.sessions = remove_stale_sessions(base_dir, session_plan.stale_sessions);
+    if store_kind == SessionStoreKind::Filesystem {
+        stats.logs = cleanup_orphaned_logs(base_dir);
+    }
+
+    Ok(stats)
+}
+
+pub fn cleanup_stale_state(base_dir: &Path) -> Result<CleanupStats, CliError> {
+    cleanup_stale_state_for_store(base_dir, SessionStoreKind::Filesystem)
+}
+
 pub fn cleanup_session_state(
     base_dir: &Path,
     session: &RuntimeSessionRecord,
@@ -1454,6 +1946,7 @@ pub fn cleanup_session_state(
 mod tests {
     use super::*;
     use crate::test_support::ENV_LOCK;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct CurrentDirGuard {
@@ -1494,6 +1987,43 @@ mod tests {
             .create_session_if_absent(&session)
             .expect("session should be created");
         session
+    }
+
+    fn write_json<T: serde::Serialize>(path: &Path, value: &T) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent directory should be created");
+        }
+        let data = serde_json::to_vec(value).expect("json serialization should succeed");
+        std::fs::write(path, data).expect("file write should succeed");
+    }
+
+    fn write_text(path: &Path, value: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent directory should be created");
+        }
+        std::fs::write(path, value).expect("file write should succeed");
+    }
+
+    fn exited_child_pid() -> u32 {
+        #[cfg(unix)]
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("child process should spawn");
+        #[cfg(windows)]
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("child process should spawn");
+
+        let pid = child.id();
+        child.wait().expect("child process should exit");
+        assert!(
+            !crate::daemon::is_process_alive(pid),
+            "expected exited child pid {} to be dead",
+            pid
+        );
+        pid
     }
 
     #[test]
@@ -1713,6 +2243,220 @@ mod tests {
                 .expect("project binding lookup"),
             None
         );
+
+        std::env::remove_var("SAURON_HOME");
+    }
+
+    #[test]
+    fn cleanup_stale_state_removes_orphaned_instance_with_dead_pid() {
+        let _guard = ENV_LOCK.lock().expect("lock poisoned");
+        let home = unique_test_home();
+        std::env::set_var("SAURON_HOME", &home);
+
+        let instance_dir = home.join("instances").join("inst-stale");
+        std::fs::create_dir_all(instance_dir.join("clients").join("client-a"))
+            .expect("client directory should exist");
+        std::fs::create_dir_all(instance_dir.join("chrome-data"))
+            .expect("chrome-data directory should exist");
+        write_text(
+            instance_dir
+                .join("clients")
+                .join("client-a")
+                .join("refs.json")
+                .as_path(),
+            "{}",
+        );
+        write_json(
+            &instance_dir.join("chrome.pid"),
+            &PidFileData {
+                pid: exited_child_pid(),
+                port: 9222,
+                xvfb_pid: None,
+                display: None,
+            },
+        );
+
+        let stats = cleanup_stale_state(&home).expect("cleanup should succeed");
+        assert_eq!(stats.instances, 1);
+        assert!(!instance_dir.exists());
+
+        std::env::remove_var("SAURON_HOME");
+    }
+
+    #[test]
+    fn cleanup_stale_state_preserves_instance_with_live_pid() {
+        let _guard = ENV_LOCK.lock().expect("lock poisoned");
+        let home = unique_test_home();
+        std::env::set_var("SAURON_HOME", &home);
+
+        let instance_dir = home.join("instances").join("inst-live");
+        std::fs::create_dir_all(instance_dir.join("clients").join("client-a"))
+            .expect("client directory should exist");
+        write_json(
+            &instance_dir.join("chrome.pid"),
+            &PidFileData {
+                pid: std::process::id(),
+                port: 9222,
+                xvfb_pid: None,
+                display: None,
+            },
+        );
+
+        let stats = cleanup_stale_state(&home).expect("cleanup should succeed");
+        assert_eq!(stats.instances, 0);
+        assert!(instance_dir.exists());
+        assert!(instance_dir.join("chrome.pid").exists());
+
+        std::env::remove_var("SAURON_HOME");
+    }
+
+    #[test]
+    fn cleanup_stale_state_removes_orphaned_session_and_bindings() {
+        let _guard = ENV_LOCK.lock().expect("lock poisoned");
+        let home = unique_test_home();
+        std::env::set_var("SAURON_HOME", &home);
+
+        let runtime_dir = home.join("runtime");
+        let mut session = RuntimeSessionRecord::new(
+            "sess-orphan".to_string(),
+            "inst-orphan".to_string(),
+            "client-orphan".to_string(),
+            None,
+            None,
+        );
+        session.mark_terminated();
+
+        write_json(
+            &runtime_dir.join("sessions").join("sess-orphan.json"),
+            &session,
+        );
+        write_json(
+            &runtime_dir
+                .join("session-bindings")
+                .join("sess-orphan.json"),
+            &vec!["project:proj-123".to_string()],
+        );
+        write_text(
+            &runtime_dir.join("project").join("proj-123.txt"),
+            "sess-orphan",
+        );
+        write_text(&runtime_dir.join("ppid").join("5555.txt"), "sess-orphan");
+
+        let stats = cleanup_stale_state(&home).expect("cleanup should succeed");
+        assert_eq!(stats.sessions, 1);
+        assert!(!runtime_dir
+            .join("sessions")
+            .join("sess-orphan.json")
+            .exists());
+        assert!(!runtime_dir
+            .join("session-bindings")
+            .join("sess-orphan.json")
+            .exists());
+        assert!(!runtime_dir.join("project").join("proj-123.txt").exists());
+        assert!(!runtime_dir.join("ppid").join("5555.txt").exists());
+
+        std::env::remove_var("SAURON_HOME");
+    }
+
+    #[test]
+    fn cleanup_stale_state_removes_malformed_session_file() {
+        let _guard = ENV_LOCK.lock().expect("lock poisoned");
+        let home = unique_test_home();
+        std::env::set_var("SAURON_HOME", &home);
+
+        let bad_session = home.join("runtime").join("sessions").join("sess-bad.json");
+        write_text(&bad_session, "{not-json");
+
+        let stats = cleanup_stale_state(&home).expect("cleanup should succeed");
+        assert_eq!(stats.sessions, 1);
+        assert!(!bad_session.exists());
+
+        std::env::remove_var("SAURON_HOME");
+    }
+
+    #[test]
+    fn cleanup_stale_state_removes_logs_for_missing_sessions() {
+        let _guard = ENV_LOCK.lock().expect("lock poisoned");
+        let home = unique_test_home();
+        std::env::set_var("SAURON_HOME", &home);
+
+        let runtime_dir = home.join("runtime");
+        let live_instance = home.join("instances").join("inst-live");
+        std::fs::create_dir_all(&live_instance).expect("live instance should exist");
+        write_json(
+            &live_instance.join("chrome.pid"),
+            &PidFileData {
+                pid: std::process::id(),
+                port: 9333,
+                xvfb_pid: None,
+                display: None,
+            },
+        );
+
+        let live_session = RuntimeSessionRecord::new(
+            "sess-live".to_string(),
+            "inst-live".to_string(),
+            "client-live".to_string(),
+            None,
+            None,
+        );
+        write_json(
+            &runtime_dir.join("sessions").join("sess-live.json"),
+            &live_session,
+        );
+
+        write_text(&runtime_dir.join("logs").join("sess-live.ndjson"), "{}\n");
+        write_text(&runtime_dir.join("logs").join("sess-gone.ndjson"), "{}\n");
+
+        let stats = cleanup_stale_state(&home).expect("cleanup should succeed");
+        assert_eq!(stats.logs, 1);
+        assert!(runtime_dir.join("logs").join("sess-live.ndjson").exists());
+        assert!(!runtime_dir.join("logs").join("sess-gone.ndjson").exists());
+
+        std::env::remove_var("SAURON_HOME");
+    }
+
+    #[test]
+    fn cleanup_stale_state_for_valkey_preserves_instance_dirs() {
+        let _guard = ENV_LOCK.lock().expect("lock poisoned");
+        let home = unique_test_home();
+        std::env::set_var("SAURON_HOME", &home);
+
+        let instance_dir = home.join("instances").join("inst-valkey");
+        std::fs::create_dir_all(instance_dir.join("clients").join("client-a"))
+            .expect("client directory should exist");
+        write_json(
+            &instance_dir.join("chrome.pid"),
+            &PidFileData {
+                pid: exited_child_pid(),
+                port: 9444,
+                xvfb_pid: None,
+                display: None,
+            },
+        );
+
+        let stats = cleanup_stale_state_for_store(&home, SessionStoreKind::Valkey)
+            .expect("cleanup should succeed");
+        assert_eq!(stats.instances, 0);
+        assert!(instance_dir.exists());
+        assert!(!instance_dir.join("chrome.pid").exists());
+
+        std::env::remove_var("SAURON_HOME");
+    }
+
+    #[test]
+    fn cleanup_stale_state_for_valkey_skips_log_cleanup() {
+        let _guard = ENV_LOCK.lock().expect("lock poisoned");
+        let home = unique_test_home();
+        std::env::set_var("SAURON_HOME", &home);
+
+        let stale_log = home.join("runtime").join("logs").join("sess-gone.ndjson");
+        write_text(&stale_log, "{}\n");
+
+        let stats = cleanup_stale_state_for_store(&home, SessionStoreKind::Valkey)
+            .expect("cleanup should succeed");
+        assert_eq!(stats.logs, 0);
+        assert!(stale_log.exists());
 
         std::env::remove_var("SAURON_HOME");
     }
