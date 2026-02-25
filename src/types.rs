@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub const DEFAULT_VIEWPORT_WIDTH: u32 = 1440;
+pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 900;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_VIEWPORT_WIDTH,
+            height: DEFAULT_VIEWPORT_HEIGHT,
+        }
+    }
+}
+
 // --- Output contract ---
 // Every browser command emits exactly one of these as JSON to stdout.
 

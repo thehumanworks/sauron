@@ -2,7 +2,6 @@ use crate::context::{atomic_write, resolve_base_dir, FileLock};
 use crate::daemon;
 use crate::errors::CliError;
 use crate::types::{ErrorCode, PidFileData};
-use clap::ValueEnum;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -13,24 +12,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const DEFAULT_TTL_SECONDS: u64 = 86_400;
-const KEY_PREFIX: &str = "sauron:runtime";
-
 const BINDING_KIND_PARENT: &str = "ppid";
 const BINDING_KIND_PROJECT: &str = "project";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum SessionStoreKind {
-    Filesystem,
-    Valkey,
-}
-
 #[derive(Debug, Clone)]
 pub struct RuntimeStore {
-    kind: SessionStoreKind,
     base_dir: PathBuf,
-    valkey_url: Option<String>,
-    ttl_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -40,30 +27,13 @@ enum BindingScope {
 }
 
 impl RuntimeStore {
-    pub fn new(
-        kind: SessionStoreKind,
-        valkey_url: Option<String>,
-        ttl_seconds: Option<u64>,
-    ) -> Result<Self, CliError> {
+    pub fn new() -> Result<Self, CliError> {
         let base_dir = resolve_base_dir()?;
-        let ttl = ttl_seconds.unwrap_or(DEFAULT_TTL_SECONDS).max(30);
-        Ok(Self {
-            kind,
-            base_dir,
-            valkey_url,
-            ttl_seconds: ttl,
-        })
-    }
-
-    pub fn kind(&self) -> SessionStoreKind {
-        self.kind
+        Ok(Self { base_dir })
     }
 
     pub fn save_session(&self, session: &RuntimeSessionRecord) -> Result<(), CliError> {
-        match self.kind {
-            SessionStoreKind::Filesystem => self.save_session_fs(session),
-            SessionStoreKind::Valkey => self.save_session_valkey(session),
-        }
+        self.save_session_fs(session)
     }
 
     /// Atomically record that a command is being executed against a session.
@@ -85,81 +55,41 @@ impl RuntimeStore {
                 "Provide a non-empty command name",
             ));
         }
-        match self.kind {
-            SessionStoreKind::Filesystem => self.mark_session_command_fs(session_id, command),
-            SessionStoreKind::Valkey => self.mark_session_command_valkey(session_id, command),
-        }
+        self.mark_session_command_fs(session_id, command)
     }
 
     pub fn create_session_if_absent(&self, session: &RuntimeSessionRecord) -> Result<(), CliError> {
-        match self.kind {
-            SessionStoreKind::Filesystem => self.create_session_if_absent_fs(session),
-            SessionStoreKind::Valkey => self.create_session_if_absent_valkey(session),
-        }
+        self.create_session_if_absent_fs(session)
     }
 
     pub fn load_session(&self, session_id: &str) -> Result<Option<RuntimeSessionRecord>, CliError> {
         validate_identifier(session_id, "session id")?;
-        match self.kind {
-            SessionStoreKind::Filesystem => self.load_session_fs(session_id),
-            SessionStoreKind::Valkey => self.load_session_valkey(session_id),
-        }
+        self.load_session_fs(session_id)
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<(), CliError> {
         validate_identifier(session_id, "session id")?;
-        match self.kind {
-            SessionStoreKind::Filesystem => self.delete_session_fs(session_id),
-            SessionStoreKind::Valkey => self.delete_session_valkey(session_id),
-        }
+        self.delete_session_fs(session_id)
     }
 
     pub fn bind_parent_process(&self, parent_pid: u32, session_id: &str) -> Result<(), CliError> {
         validate_identifier(session_id, "session id")?;
-        match self.kind {
-            SessionStoreKind::Filesystem => {
-                self.bind_scope_fs(BindingScope::ParentProcess(parent_pid), session_id)
-            }
-            SessionStoreKind::Valkey => {
-                self.bind_scope_valkey(BindingScope::ParentProcess(parent_pid), session_id)
-            }
-        }
+        self.bind_scope_fs(BindingScope::ParentProcess(parent_pid), session_id)
     }
 
     pub fn bind_project(&self, project_key: &str, session_id: &str) -> Result<(), CliError> {
         validate_identifier(project_key, "project key")?;
         validate_identifier(session_id, "session id")?;
-        match self.kind {
-            SessionStoreKind::Filesystem => {
-                self.bind_scope_fs(BindingScope::Project(project_key.to_string()), session_id)
-            }
-            SessionStoreKind::Valkey => {
-                self.bind_scope_valkey(BindingScope::Project(project_key.to_string()), session_id)
-            }
-        }
+        self.bind_scope_fs(BindingScope::Project(project_key.to_string()), session_id)
     }
 
     pub fn resolve_bound_session(&self, parent_pid: u32) -> Result<Option<String>, CliError> {
-        match self.kind {
-            SessionStoreKind::Filesystem => {
-                self.resolve_bound_scope_fs(BindingScope::ParentProcess(parent_pid))
-            }
-            SessionStoreKind::Valkey => {
-                self.resolve_bound_scope_valkey(BindingScope::ParentProcess(parent_pid))
-            }
-        }
+        self.resolve_bound_scope_fs(BindingScope::ParentProcess(parent_pid))
     }
 
     pub fn resolve_project_binding(&self, project_key: &str) -> Result<Option<String>, CliError> {
         validate_identifier(project_key, "project key")?;
-        match self.kind {
-            SessionStoreKind::Filesystem => {
-                self.resolve_bound_scope_fs(BindingScope::Project(project_key.to_string()))
-            }
-            SessionStoreKind::Valkey => {
-                self.resolve_bound_scope_valkey(BindingScope::Project(project_key.to_string()))
-            }
-        }
+        self.resolve_bound_scope_fs(BindingScope::Project(project_key.to_string()))
     }
 
     pub fn unbind_parent_process_if_matches(
@@ -168,15 +98,7 @@ impl RuntimeStore {
         session_id: &str,
     ) -> Result<(), CliError> {
         validate_identifier(session_id, "session id")?;
-        match self.kind {
-            SessionStoreKind::Filesystem => {
-                self.unbind_scope_if_matches_fs(BindingScope::ParentProcess(parent_pid), session_id)
-            }
-            SessionStoreKind::Valkey => self.unbind_scope_if_matches_valkey(
-                BindingScope::ParentProcess(parent_pid),
-                session_id,
-            ),
-        }
+        self.unbind_scope_if_matches_fs(BindingScope::ParentProcess(parent_pid), session_id)
     }
 
     pub fn unbind_project_if_matches(
@@ -186,24 +108,12 @@ impl RuntimeStore {
     ) -> Result<(), CliError> {
         validate_identifier(project_key, "project key")?;
         validate_identifier(session_id, "session id")?;
-        match self.kind {
-            SessionStoreKind::Filesystem => self.unbind_scope_if_matches_fs(
-                BindingScope::Project(project_key.to_string()),
-                session_id,
-            ),
-            SessionStoreKind::Valkey => self.unbind_scope_if_matches_valkey(
-                BindingScope::Project(project_key.to_string()),
-                session_id,
-            ),
-        }
+        self.unbind_scope_if_matches_fs(BindingScope::Project(project_key.to_string()), session_id)
     }
 
     pub fn remove_bindings_for_session(&self, session_id: &str) -> Result<(), CliError> {
         validate_identifier(session_id, "session id")?;
-        match self.kind {
-            SessionStoreKind::Filesystem => self.remove_bindings_for_session_fs(session_id),
-            SessionStoreKind::Valkey => self.remove_bindings_for_session_valkey(session_id),
-        }
+        self.remove_bindings_for_session_fs(session_id)
     }
 
     pub fn append_log(
@@ -683,354 +593,6 @@ impl RuntimeStore {
         self.save_binding_index_fs_locked(session_id, &HashSet::new())?;
         Ok(())
     }
-
-    fn valkey_url(&self) -> Result<String, CliError> {
-        if let Some(v) = &self.valkey_url {
-            if !v.trim().is_empty() {
-                return Ok(v.clone());
-            }
-        }
-        if let Ok(v) = std::env::var("SAURON_VALKEY_URL") {
-            if !v.trim().is_empty() {
-                return Ok(v);
-            }
-        }
-        Err(CliError::bad_input(
-            "Valkey backend selected but no URL was provided",
-            "Set --valkey-url or SAURON_VALKEY_URL (for example redis://127.0.0.1:6379/)",
-        ))
-    }
-
-    fn with_valkey_connection<T, F>(&self, f: F) -> Result<T, CliError>
-    where
-        F: FnOnce(&mut redis::Connection) -> Result<T, redis::RedisError>,
-    {
-        let url = self.valkey_url()?;
-        let client = redis::Client::open(url.clone()).map_err(|e| {
-            CliError::unknown(
-                format!("Failed to create Valkey client for {}: {}", url, e),
-                "Check the Valkey URL format and availability",
-            )
-        })?;
-        let mut conn = client.get_connection().map_err(|e| {
-            CliError::unknown(
-                format!("Failed to connect to Valkey at {}: {}", url, e),
-                "Ensure the Valkey server is reachable",
-            )
-        })?;
-        f(&mut conn).map_err(|e| {
-            CliError::unknown(
-                format!("Valkey operation failed: {}", e),
-                "Ensure Valkey is running and accessible",
-            )
-        })
-    }
-
-    fn key_session(session_id: &str) -> String {
-        format!("{}:session:{}", KEY_PREFIX, session_id)
-    }
-
-    fn key_parent(parent_pid: u32) -> String {
-        format!("{}:ppid:{}", KEY_PREFIX, parent_pid)
-    }
-
-    fn key_project(project_key: &str) -> String {
-        format!(
-            "{}:bind:{}:{}",
-            KEY_PREFIX, BINDING_KIND_PROJECT, project_key
-        )
-    }
-
-    fn key_session_binding_index(session_id: &str) -> String {
-        format!("{}:idx:session:{}:bindings", KEY_PREFIX, session_id)
-    }
-
-    fn key_session_binding_index_prefix() -> String {
-        format!("{}:idx:session:", KEY_PREFIX)
-    }
-
-    fn valkey_binding_key(scope: &BindingScope) -> String {
-        match scope {
-            BindingScope::ParentProcess(pid) => Self::key_parent(*pid),
-            BindingScope::Project(project_key) => Self::key_project(project_key),
-        }
-    }
-
-    fn save_session_valkey(&self, session: &RuntimeSessionRecord) -> Result<(), CliError> {
-        let session_key = Self::key_session(&session.session_id);
-        let payload = serde_json::to_string(session).map_err(|e| {
-            CliError::unknown(
-                format!("Failed to serialize runtime session for Valkey: {}", e),
-                "This should not happen",
-            )
-        })?;
-        let ttl = self.ttl_seconds;
-        self.with_valkey_connection(|conn| {
-            let set_result: Option<String> = redis::cmd("SET")
-                .arg(&session_key)
-                .arg(payload)
-                .arg("XX")
-                .arg("EX")
-                .arg(ttl)
-                .query(conn)?;
-            if set_result.is_none() {
-                return Err(redis::RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "session missing",
-                )));
-            }
-            Ok(())
-        })
-        .map_err(|e| {
-            if e.message.contains("session missing") {
-                CliError::session_invalid(
-                    format!("Session '{}' was not found", session.session_id),
-                    "Run 'sauron start' to create a fresh session",
-                )
-            } else {
-                e
-            }
-        })
-    }
-
-    fn mark_session_command_valkey(
-        &self,
-        session_id: &str,
-        command: &str,
-    ) -> Result<RuntimeSessionRecord, CliError> {
-        let session_key = Self::key_session(session_id);
-        let updated_at = chrono::Utc::now().to_rfc3339();
-        let ttl = self.ttl_seconds;
-        let mark_script = redis::Script::new(
-            r#"
-                local raw = redis.call('GET', KEYS[1])
-                if not raw then
-                    return redis.error_reply('SESSION_MISSING')
-                end
-                local session = cjson.decode(raw)
-                if session['state'] ~= 'active' then
-                    return redis.error_reply('SESSION_TERMINATED')
-                end
-                local count = tonumber(session['commandCount']) or 0
-                session['commandCount'] = count + 1
-                session['lastCommand'] = ARGV[1]
-                session['updatedAt'] = ARGV[2]
-                local payload = cjson.encode(session)
-                redis.call('SET', KEYS[1], payload, 'EX', ARGV[3])
-                return payload
-            "#,
-        );
-        self.with_valkey_connection(|conn| {
-            mark_script
-                .key(&session_key)
-                .arg(command)
-                .arg(&updated_at)
-                .arg(ttl as i64)
-                .invoke::<String>(conn)
-        })
-        .map_err(|e| {
-            if e.message.contains("SESSION_MISSING") {
-                CliError::session_invalid(
-                    format!("Session '{}' was not found", session_id),
-                    "Run 'sauron start' to create a fresh session",
-                )
-            } else if e.message.contains("SESSION_TERMINATED") {
-                CliError::session_terminated(
-                    format!("Session '{}' is terminated", session_id),
-                    "Run 'sauron start' to create a new active session",
-                )
-            } else {
-                e
-            }
-        })
-        .and_then(|payload| {
-            serde_json::from_str::<RuntimeSessionRecord>(&payload).map_err(|e| {
-                CliError::unknown(
-                    format!("Failed to parse updated Valkey session record: {}", e),
-                    "The runtime session data may be corrupted",
-                )
-            })
-        })
-    }
-
-    fn create_session_if_absent_valkey(
-        &self,
-        session: &RuntimeSessionRecord,
-    ) -> Result<(), CliError> {
-        let session_key = Self::key_session(&session.session_id);
-        let payload = serde_json::to_string(session).map_err(|e| {
-            CliError::unknown(
-                format!("Failed to serialize runtime session for Valkey: {}", e),
-                "This should not happen",
-            )
-        })?;
-        let ttl = self.ttl_seconds;
-        self.with_valkey_connection(|conn| {
-            let set_result: Option<String> = redis::cmd("SET")
-                .arg(&session_key)
-                .arg(payload)
-                .arg("NX")
-                .arg("EX")
-                .arg(ttl)
-                .query(conn)?;
-            if set_result.is_none() {
-                return Err(redis::RedisError::from((
-                    redis::ErrorKind::BusyLoadingError,
-                    "session exists",
-                )));
-            }
-            Ok(())
-        })
-        .map_err(|e| {
-            if e.message.contains("session exists") {
-                CliError::new(
-                    ErrorCode::SessionConflict,
-                    format!("Session '{}' already exists", session.session_id),
-                    "Use a different --session-id or omit it to auto-generate one",
-                    false,
-                    6,
-                )
-            } else {
-                e
-            }
-        })
-    }
-
-    fn load_session_valkey(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<RuntimeSessionRecord>, CliError> {
-        let session_key = Self::key_session(session_id);
-        self.with_valkey_connection(|conn| {
-            let raw: Option<String> = redis::cmd("GET").arg(&session_key).query(conn)?;
-            match raw {
-                Some(text) => {
-                    let parsed =
-                        serde_json::from_str::<RuntimeSessionRecord>(&text).map_err(|_| {
-                            redis::RedisError::from((redis::ErrorKind::TypeError, "invalid json"))
-                        })?;
-                    Ok(Some(parsed))
-                }
-                None => Ok(None),
-            }
-        })
-    }
-
-    fn delete_session_valkey(&self, session_id: &str) -> Result<(), CliError> {
-        let session_key = Self::key_session(session_id);
-        self.with_valkey_connection(|conn| {
-            redis::cmd("DEL").arg(session_key).query::<i64>(conn)?;
-            Ok(())
-        })
-    }
-
-    fn bind_scope_valkey(&self, scope: BindingScope, session_id: &str) -> Result<(), CliError> {
-        let session_key = Self::key_session(session_id);
-        let binding_key = Self::valkey_binding_key(&scope);
-        let index_key = Self::key_session_binding_index(session_id);
-        let index_prefix = Self::key_session_binding_index_prefix();
-        let ttl = self.ttl_seconds;
-        let bind_script = redis::Script::new(
-            r#"
-                if redis.call('EXISTS', KEYS[1]) == 0 then
-                    return redis.error_reply('SESSION_MISSING')
-                end
-                local old_sid = redis.call('GET', KEYS[2])
-                if old_sid and old_sid ~= ARGV[1] then
-                    redis.call('SREM', ARGV[3] .. old_sid .. ':bindings', KEYS[2])
-                end
-                redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
-                redis.call('SADD', KEYS[3], KEYS[2])
-                redis.call('EXPIRE', KEYS[3], ARGV[2])
-                return 1
-            "#,
-        );
-
-        self.with_valkey_connection(|conn| {
-            bind_script
-                .key(session_key)
-                .key(binding_key)
-                .key(index_key)
-                .arg(session_id)
-                .arg(ttl as i64)
-                .arg(index_prefix)
-                .invoke::<i64>(conn)?;
-            Ok(())
-        })
-        .map_err(|e| {
-            if e.message.contains("SESSION_MISSING") {
-                CliError::session_invalid(
-                    format!("Session '{}' was not found", session_id),
-                    "Run 'sauron start' to create a fresh session",
-                )
-            } else {
-                e
-            }
-        })
-    }
-
-    fn resolve_bound_scope_valkey(&self, scope: BindingScope) -> Result<Option<String>, CliError> {
-        let binding_key = Self::valkey_binding_key(&scope);
-        self.with_valkey_connection(|conn| {
-            let raw: Option<String> = redis::cmd("GET").arg(binding_key).query(conn)?;
-            Ok(raw)
-        })
-    }
-
-    fn unbind_scope_if_matches_valkey(
-        &self,
-        scope: BindingScope,
-        session_id: &str,
-    ) -> Result<(), CliError> {
-        let binding_key = Self::valkey_binding_key(&scope);
-        let index_key = Self::key_session_binding_index(session_id);
-        let unbind_script = redis::Script::new(
-            r#"
-                if redis.call('GET', KEYS[1]) == ARGV[1] then
-                    redis.call('DEL', KEYS[1])
-                end
-                redis.call('SREM', KEYS[2], KEYS[1])
-                if redis.call('SCARD', KEYS[2]) == 0 then
-                    redis.call('DEL', KEYS[2])
-                end
-                return 1
-            "#,
-        );
-        self.with_valkey_connection(|conn| {
-            unbind_script
-                .key(binding_key)
-                .key(index_key)
-                .arg(session_id)
-                .invoke::<i64>(conn)?;
-            Ok(())
-        })
-    }
-
-    fn remove_bindings_for_session_valkey(&self, session_id: &str) -> Result<(), CliError> {
-        let index_key = Self::key_session_binding_index(session_id);
-        let cleanup_script = redis::Script::new(
-            r#"
-                local keys = redis.call('SMEMBERS', KEYS[1])
-                local removed = 0
-                for _, binding_key in ipairs(keys) do
-                    if redis.call('GET', binding_key) == ARGV[1] then
-                        redis.call('DEL', binding_key)
-                        removed = removed + 1
-                    end
-                    redis.call('SREM', KEYS[1], binding_key)
-                end
-                redis.call('DEL', KEYS[1])
-                return removed
-            "#,
-        );
-        self.with_valkey_connection(|conn| {
-            cleanup_script
-                .key(index_key)
-                .arg(session_id)
-                .invoke::<i64>(conn)?;
-            Ok(())
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1056,8 +618,20 @@ pub struct RuntimeSessionRecord {
     pub updated_at: String,
     pub started_by_pid: u32,
     pub started_by_ppid: u32,
+    #[serde(default = "default_viewport_width")]
+    pub viewport_width: u32,
+    #[serde(default = "default_viewport_height")]
+    pub viewport_height: u32,
     pub command_count: u64,
     pub last_command: Option<String>,
+}
+
+fn default_viewport_width() -> u32 {
+    crate::types::DEFAULT_VIEWPORT_WIDTH
+}
+
+fn default_viewport_height() -> u32 {
+    crate::types::DEFAULT_VIEWPORT_HEIGHT
 }
 
 impl RuntimeSessionRecord {
@@ -1081,6 +655,8 @@ impl RuntimeSessionRecord {
             updated_at: now,
             started_by_pid: std::process::id(),
             started_by_ppid: parent_process_id(),
+            viewport_width: default_viewport_width(),
+            viewport_height: default_viewport_height(),
             command_count: 0,
             last_command: None,
         }
@@ -1095,6 +671,13 @@ impl RuntimeSessionRecord {
     pub fn mark_terminated(&mut self) {
         self.state = RuntimeSessionState::Terminated;
         self.updated_at = chrono::Utc::now().to_rfc3339();
+    }
+
+    pub fn viewport(&self) -> crate::types::Viewport {
+        crate::types::Viewport {
+            width: self.viewport_width,
+            height: self.viewport_height,
+        }
     }
 }
 
@@ -1846,28 +1429,15 @@ fn cleanup_orphaned_logs(base_dir: &Path) -> usize {
     removed
 }
 
-pub fn cleanup_stale_state_for_store(
-    base_dir: &Path,
-    store_kind: SessionStoreKind,
-) -> Result<CleanupStats, CliError> {
+pub fn cleanup_stale_state(base_dir: &Path) -> Result<CleanupStats, CliError> {
     let mut stats = CleanupStats::default();
     let session_plan = build_session_cleanup_plan(base_dir);
 
-    stats.instances = cleanup_orphaned_instances(
-        base_dir,
-        &session_plan.active_instances,
-        store_kind == SessionStoreKind::Filesystem,
-    );
+    stats.instances = cleanup_orphaned_instances(base_dir, &session_plan.active_instances, true);
     stats.sessions = remove_stale_sessions(base_dir, session_plan.stale_sessions);
-    if store_kind == SessionStoreKind::Filesystem {
-        stats.logs = cleanup_orphaned_logs(base_dir);
-    }
+    stats.logs = cleanup_orphaned_logs(base_dir);
 
     Ok(stats)
-}
-
-pub fn cleanup_stale_state(base_dir: &Path) -> Result<CleanupStats, CliError> {
-    cleanup_stale_state_for_store(base_dir, SessionStoreKind::Filesystem)
 }
 
 pub fn cleanup_session_state(
@@ -2042,8 +1612,7 @@ mod tests {
         let home = unique_test_home();
         std::env::set_var("SAURON_HOME", &home);
 
-        let store = RuntimeStore::new(SessionStoreKind::Filesystem, None, Some(60))
-            .expect("store should initialize");
+        let store = RuntimeStore::new().expect("store should initialize");
         let session = RuntimeSessionRecord::new(
             "sess-test".to_string(),
             "inst-test".to_string(),
@@ -2092,8 +1661,7 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("failed to create nested dir");
         let _cwd_guard = CurrentDirGuard::change_to(&nested);
 
-        let store = RuntimeStore::new(SessionStoreKind::Filesystem, None, Some(60))
-            .expect("store should initialize");
+        let store = RuntimeStore::new().expect("store should initialize");
         let ppid = parent_process_id();
         let project_key = resolve_project_binding_key().expect("project key should resolve");
 
@@ -2151,8 +1719,7 @@ mod tests {
         std::fs::create_dir_all(project_root.join(".git")).expect("failed to create .git");
         let _cwd_guard = CurrentDirGuard::change_to(&project_root);
 
-        let store = RuntimeStore::new(SessionStoreKind::Filesystem, None, Some(60))
-            .expect("store should initialize");
+        let store = RuntimeStore::new().expect("store should initialize");
         let ppid = parent_process_id();
         let project_key = resolve_project_binding_key().expect("project key should resolve");
         seed_session(&store, "sess-env");
@@ -2188,8 +1755,7 @@ mod tests {
         let home = unique_test_home();
         std::env::set_var("SAURON_HOME", &home);
 
-        let store = RuntimeStore::new(SessionStoreKind::Filesystem, None, Some(60))
-            .expect("store should initialize");
+        let store = RuntimeStore::new().expect("store should initialize");
         let mut session = seed_session(&store, "sess-existing");
         store
             .delete_session("sess-existing")
@@ -2214,8 +1780,7 @@ mod tests {
         std::fs::create_dir_all(project_root.join(".git")).expect("failed to create .git");
         let _cwd_guard = CurrentDirGuard::change_to(&project_root);
 
-        let store = RuntimeStore::new(SessionStoreKind::Filesystem, None, Some(60))
-            .expect("store should initialize");
+        let store = RuntimeStore::new().expect("store should initialize");
         let ppid = parent_process_id();
         let project_key = resolve_project_binding_key().expect("project key should resolve");
         let session = seed_session(&store, "sess-cleanup");
@@ -2412,51 +1977,6 @@ mod tests {
         assert_eq!(stats.logs, 1);
         assert!(runtime_dir.join("logs").join("sess-live.ndjson").exists());
         assert!(!runtime_dir.join("logs").join("sess-gone.ndjson").exists());
-
-        std::env::remove_var("SAURON_HOME");
-    }
-
-    #[test]
-    fn cleanup_stale_state_for_valkey_preserves_instance_dirs() {
-        let _guard = ENV_LOCK.lock().expect("lock poisoned");
-        let home = unique_test_home();
-        std::env::set_var("SAURON_HOME", &home);
-
-        let instance_dir = home.join("instances").join("inst-valkey");
-        std::fs::create_dir_all(instance_dir.join("clients").join("client-a"))
-            .expect("client directory should exist");
-        write_json(
-            &instance_dir.join("chrome.pid"),
-            &PidFileData {
-                pid: exited_child_pid(),
-                port: 9444,
-                xvfb_pid: None,
-                display: None,
-            },
-        );
-
-        let stats = cleanup_stale_state_for_store(&home, SessionStoreKind::Valkey)
-            .expect("cleanup should succeed");
-        assert_eq!(stats.instances, 0);
-        assert!(instance_dir.exists());
-        assert!(!instance_dir.join("chrome.pid").exists());
-
-        std::env::remove_var("SAURON_HOME");
-    }
-
-    #[test]
-    fn cleanup_stale_state_for_valkey_skips_log_cleanup() {
-        let _guard = ENV_LOCK.lock().expect("lock poisoned");
-        let home = unique_test_home();
-        std::env::set_var("SAURON_HOME", &home);
-
-        let stale_log = home.join("runtime").join("logs").join("sess-gone.ndjson");
-        write_text(&stale_log, "{}\n");
-
-        let stats = cleanup_stale_state_for_store(&home, SessionStoreKind::Valkey)
-            .expect("cleanup should succeed");
-        assert_eq!(stats.logs, 0);
-        assert!(stale_log.exists());
 
         std::env::remove_var("SAURON_HOME");
     }

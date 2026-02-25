@@ -12,6 +12,51 @@ use std::time::{Duration, Instant};
 const CDP_TIMEOUT: Duration = Duration::from_millis(10_000);
 const WAIT_POLL: Duration = Duration::from_millis(100);
 
+#[derive(Debug, Clone, Copy)]
+pub enum ScreenshotQuality {
+    Low,
+    Medium,
+    High,
+}
+
+impl ScreenshotQuality {
+    fn format(self) -> &'static str {
+        match self {
+            Self::High => "png",
+            Self::Low | Self::Medium => "jpeg",
+        }
+    }
+
+    fn jpeg_quality(self) -> Option<u8> {
+        match self {
+            Self::High => None,
+            Self::Medium => Some(82),
+            Self::Low => Some(60),
+        }
+    }
+
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::High => "image/png",
+            Self::Low | Self::Medium => "image/jpeg",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::High => "png",
+            Self::Low | Self::Medium => "jpg",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScreenshotData {
+    pub data: String,
+    pub mime: String,
+    pub extension: String,
+}
+
 // --- Browser connection ---
 
 #[derive(Clone)]
@@ -202,7 +247,12 @@ impl BrowserClient {
                     self.create_target("about:blank").await?
                 };
 
-                save_client_target_binding(ctx, &ClientTargetBinding { target_id: id.clone() })?;
+                save_client_target_binding(
+                    ctx,
+                    &ClientTargetBinding {
+                        target_id: id.clone(),
+                    },
+                )?;
                 id
             }
         };
@@ -517,7 +567,52 @@ impl PageClient {
         }
     }
 
-    pub async fn capture_screenshot(&self, full_page: bool) -> Result<String, CliError> {
+    pub async fn set_viewport(
+        &self,
+        width: u32,
+        height: u32,
+        mobile: bool,
+    ) -> Result<(), CliError> {
+        let _ = self
+            .call(
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": width,
+                    "height": height,
+                    "deviceScaleFactor": 1,
+                    "mobile": mobile,
+                }),
+                CDP_TIMEOUT,
+            )
+            .await?;
+
+        let _ = self
+            .call(
+                "Emulation.setTouchEmulationEnabled",
+                json!({
+                    "enabled": mobile,
+                    "maxTouchPoints": if mobile { 5 } else { 0 }
+                }),
+                CDP_TIMEOUT,
+            )
+            .await;
+
+        Ok(())
+    }
+
+    pub async fn capture_screenshot(
+        &self,
+        full_page: bool,
+        quality: ScreenshotQuality,
+    ) -> Result<ScreenshotData, CliError> {
+        let mut base_params = json!({
+            "format": quality.format(),
+            "optimizeForSpeed": false,
+        });
+        if let Some(q) = quality.jpeg_quality() {
+            base_params["quality"] = json!(q);
+        }
+
         if full_page {
             // Get content size
             let metrics = self
@@ -537,36 +632,37 @@ impl PageClient {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(720.0);
 
+            let mut params = base_params.clone();
+            params["captureBeyondViewport"] = json!(true);
+            params["clip"] =
+                json!({ "x": 0, "y": 0, "width": width, "height": height, "scale": 1 });
+
             let res = self
-                .call(
-                    "Page.captureScreenshot",
-                    json!({
-                        "format": "png",
-                        "captureBeyondViewport": true,
-                        "clip": { "x": 0, "y": 0, "width": width, "height": height, "scale": 1 }
-                    }),
-                    CDP_TIMEOUT,
-                )
+                .call("Page.captureScreenshot", params, CDP_TIMEOUT)
                 .await?;
 
             let data = res
                 .get("data")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| CliError::unknown("Page.captureScreenshot missing data", ""))?;
-            Ok(data.to_string())
+            Ok(ScreenshotData {
+                data: data.to_string(),
+                mime: quality.mime_type().to_string(),
+                extension: quality.extension().to_string(),
+            })
         } else {
             let res = self
-                .call(
-                    "Page.captureScreenshot",
-                    json!({ "format": "png" }),
-                    CDP_TIMEOUT,
-                )
+                .call("Page.captureScreenshot", base_params, CDP_TIMEOUT)
                 .await?;
             let data = res
                 .get("data")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| CliError::unknown("Page.captureScreenshot missing data", ""))?;
-            Ok(data.to_string())
+            Ok(ScreenshotData {
+                data: data.to_string(),
+                mime: quality.mime_type().to_string(),
+                extension: quality.extension().to_string(),
+            })
         }
     }
 
@@ -953,7 +1049,6 @@ impl PageClient {
             other => Ok(other.to_string()),
         }
     }
-
 
     pub async fn wait_for_text(&self, text: &str, timeout: Duration) -> Result<(), CliError> {
         let deadline = Instant::now() + timeout;

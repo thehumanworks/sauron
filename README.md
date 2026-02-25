@@ -10,8 +10,9 @@ This is a rewrite of the attached Bun/TypeScript `sauron` project as a compiled 
 - **Fast** startup and execution (single static-ish binary)
 - **Process-safe concurrency** with mandatory runtime sessions (`start` before browser commands)
 - **Per-session isolation** with generated `session_id`, `instance`, and `client` IDs by default
-- Optional runtime state backend in filesystem or Valkey
-- Uses Chrome **`--headless=new`** by default (or `--headed` with non-obstructive launch flags; macOS uses windowless startup)
+- Filesystem-only runtime state storage under `~/.sauron/runtime/`
+- Uses Chrome **`--headless=new`** only (opinionated headless runtime)
+- Default viewport is **1440x900** (override with `--viewport WIDTHxHEIGHT`)
 
 ## Install
 
@@ -33,6 +34,8 @@ Each shell/process must start a runtime session first:
 sauron start
 ```
 
+macOS defaults to GPU + WebGL rendering flags on `start` (opt out with `--webgl=false --enable-gpu=false`).
+
 `start` prints:
 
 - Session ID
@@ -46,6 +49,7 @@ Then run browser commands from the same project directory:
 sauron navigate https://example.com
 sauron snapshot
 sauron click @e1
+sauron screenshot --responsive --quality medium
 ```
 
 Clean up with:
@@ -101,19 +105,9 @@ If you previously exported `SAURON_SESSION_ID`, clear it to avoid overriding pro
 unset SAURON_SESSION_ID
 ```
 
-## Runtime state backends
+## Runtime state
 
-Default backend: filesystem under `~/.sauron/runtime/`.
-
-Valkey backend:
-
-```bash
-sauron --session-store valkey --valkey-url redis://127.0.0.1:6379/ start
-sauron --session-store valkey --valkey-url redis://127.0.0.1:6379/ navigate https://example.com
-sauron --session-store valkey --valkey-url redis://127.0.0.1:6379/ terminate
-```
-
-When using Valkey, use the same `--session-store` and `--valkey-url` on all commands for that session.
+Runtime session state is stored on the local filesystem under `~/.sauron/runtime/`.
 
 ## Session logs
 
@@ -125,10 +119,17 @@ Each line includes timestamp, session metadata, command name, status, and error 
 
 ## CLI flag placement
 
-Global flags (`--session-id`, `--session-store`, `--valkey-url`, `--port`, etc.) must be placed before the subcommand:
+Global flags (`--session-id`, `--port`, etc.) must be placed before the subcommand:
 
 ```bash
 sauron --session-id mysession navigate https://example.com
+```
+
+`--viewport` is global and applies to `start` and browser commands:
+
+```bash
+sauron --viewport 1440x900 start
+sauron --viewport 390x844 screenshot
 ```
 
 ## Output contract

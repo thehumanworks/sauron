@@ -1,6 +1,6 @@
 use crate::context::{remove_pid_file, write_pid_file, FileLock};
 use crate::errors::CliError;
-use crate::types::{DaemonStatus, PidFileData};
+use crate::types::{DaemonStatus, PidFileData, Viewport};
 use rand::Rng;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -16,10 +16,10 @@ pub struct ChromeLaunchOptions {
     pub headless: bool,
     /// Disable GPU acceleration (`--disable-gpu`).
     pub disable_gpu: bool,
-    /// Enable WebGL-friendly flags (SwiftShader).
+    /// Enable WebGL-friendly flags (SwiftShader). macOS-only.
     pub webgl: bool,
-    /// Run headed Chrome under Xvfb (Linux only).
-    pub xvfb: bool,
+    /// Initial viewport size passed to Chrome at launch.
+    pub viewport: Viewport,
 }
 
 pub async fn get_ws_url(port: u16) -> Result<String, CliError> {
@@ -185,6 +185,10 @@ pub fn build_chrome_args(
     opts: ChromeLaunchOptions,
 ) -> Vec<String> {
     let mut args = Vec::new();
+    args.push(format!(
+        "--window-size={},{}",
+        opts.viewport.width, opts.viewport.height
+    ));
 
     if opts.headless {
         args.push("--headless=new".to_string());
@@ -199,7 +203,6 @@ pub fn build_chrome_args(
         #[cfg(not(target_os = "macos"))]
         {
             // Best-effort: keep the window from interrupting user flow.
-            args.push("--window-size=1,1".to_string());
             args.push("--window-position=-32000,-32000".to_string());
             args.push("--start-minimized".to_string());
         }
@@ -209,6 +212,7 @@ pub fn build_chrome_args(
         args.push("--disable-gpu".to_string());
     }
 
+    #[cfg(target_os = "macos")]
     if opts.webgl {
         // WebGL in headless/server environments often needs explicit SwiftShader opt-in.
         // See: Chromium SwiftShader docs and the deprecation of automatic SwiftShader fallback.
@@ -328,11 +332,7 @@ pub async fn start(
         ));
     }
 
-    // Xvfb implies headed Chrome (not headless).
-    let mut launch_opts = opts;
-    if launch_opts.xvfb {
-        launch_opts.headless = false;
-    }
+    let launch_opts = opts;
 
     // Choose port.
     let port = if let Some(p) = port_flag {
@@ -417,27 +417,7 @@ pub async fn start(
 
     let binary = find_chrome_binary();
 
-    #[cfg(target_os = "linux")]
-    let (xvfb_pid, display): (Option<u32>, Option<String>) = if launch_opts.xvfb {
-        let (child, disp) = start_xvfb().await?;
-        // We intentionally manage Xvfb by PID for `sauron stop`.
-        let pid = child.id();
-        drop(child);
-        (Some(pid), Some(disp))
-    } else {
-        (None, None)
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let (xvfb_pid, display): (Option<u32>, Option<String>) = {
-        if launch_opts.xvfb {
-            return Err(CliError::bad_input(
-                "--xvfb is only supported on Linux",
-                "Use --headed instead, or run on Linux with Xvfb installed",
-            ));
-        }
-        (None, None)
-    };
+    let (xvfb_pid, display): (Option<u32>, Option<String>) = (None, None);
 
     let args = build_chrome_args(port, &user_data_dir, launch_opts);
 
@@ -458,12 +438,9 @@ pub async fn start(
     }
 
     let child = cmd.spawn().map_err(|e| {
-        if let Some(pid) = xvfb_pid {
-            best_effort_terminate_pid(pid);
-        }
         CliError::unknown(
             format!("Failed to spawn Chrome: {}", e),
-            "Ensure Chrome is installed and discoverable (and Xvfb is installed when using --xvfb)",
+            "Ensure Chrome is installed and discoverable",
         )
     })?;
 
@@ -494,15 +471,12 @@ pub async fn start(
             }
             Err(_) => {
                 if !is_process_alive(pid) {
-                    if let Some(xpid) = xvfb_pid {
-                        best_effort_terminate_pid(xpid);
-                    }
                     return Err(CliError::unknown(
                         format!(
                             "Chrome process (pid: {}) died during startup on port {}",
                             pid, port
                         ),
-                        "Check Chrome logs; try running with --headed or --xvfb to debug rendering issues",
+                        "Check Chrome logs and retry with a longer --timeout if needed",
                     ));
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
@@ -519,10 +493,6 @@ pub async fn start(
     {
         let _ = terminate_process(pid);
     }
-    if let Some(xpid) = xvfb_pid {
-        best_effort_terminate_pid(xpid);
-    }
-
     Err(CliError::timeout(
         format!(
             "Chrome failed to start within {}ms on port {}",
@@ -628,7 +598,10 @@ mod tests {
             headless,
             disable_gpu: true,
             webgl: false,
-            xvfb: false,
+            viewport: Viewport {
+                width: 1440,
+                height: 900,
+            },
         }
     }
 
@@ -641,6 +614,7 @@ mod tests {
         );
 
         assert!(args.iter().any(|arg| arg == "--headless=new"));
+        assert!(args.iter().any(|arg| arg == "--window-size=1440,900"));
     }
 
     #[cfg(target_os = "macos")]
@@ -666,11 +640,22 @@ mod tests {
             launch_opts(false),
         );
 
-        assert!(args.iter().any(|arg| arg == "--window-size=1,1"));
+        assert!(args.iter().any(|arg| arg == "--window-size=1440,900"));
         assert!(args
             .iter()
             .any(|arg| arg == "--window-position=-32000,-32000"));
         assert!(args.iter().any(|arg| arg == "--start-minimized"));
         assert!(!args.iter().any(|arg| arg == "--no-startup-window"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn build_chrome_args_non_macos_ignores_webgl_flags() {
+        let mut opts = launch_opts(true);
+        opts.webgl = true;
+        let args = build_chrome_args(9222, Path::new("/tmp/sauron-test-profile"), opts);
+
+        assert!(!args.iter().any(|arg| arg == "--enable-webgl"));
+        assert!(!args.iter().any(|arg| arg == "--use-angle=swiftshader"));
     }
 }

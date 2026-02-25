@@ -18,10 +18,9 @@ use clap_complete::{generate, Shell};
 use context::AppContext;
 use errors::{make_error, make_success, print_result, CliError};
 use runtime::{
-    activate_session, cleanup_session_state, cleanup_stale_state, cleanup_stale_state_for_store,
-    create_session_record, resolve_active_session, resolve_project_root_path,
-    session_required_error, terminate_session, CleanupStats, RuntimeSessionRecord, RuntimeStore,
-    SessionStoreKind,
+    activate_session, cleanup_session_state, cleanup_stale_state, create_session_record,
+    resolve_active_session, resolve_project_root_path, session_required_error, terminate_session,
+    CleanupStats, RuntimeSessionRecord, RuntimeStore,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -47,18 +46,6 @@ struct Cli {
     #[arg(long)]
     client: Option<String>,
 
-    /// Runtime session storage backend
-    #[arg(long, default_value = "filesystem", value_enum)]
-    session_store: SessionStoreKind,
-
-    /// Valkey URL when --session-store=valkey (or set SAURON_VALKEY_URL)
-    #[arg(long)]
-    valkey_url: Option<String>,
-
-    /// Session TTL in seconds (used by Valkey backend)
-    #[arg(long)]
-    session_ttl_seconds: Option<u64>,
-
     /// Chrome DevTools debugging port (overrides pidfile)
     #[arg(long)]
     port: Option<u16>,
@@ -81,6 +68,13 @@ struct Cli {
     #[arg(long, global = true)]
     wait: Option<u64>,
 
+    /// Viewport in WIDTHxHEIGHT format (e.g. 1440x900).
+    ///
+    /// - `sauron start`: sets the session default viewport.
+    /// - Browser commands: overrides the viewport for this invocation.
+    #[arg(long, global = true)]
+    viewport: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -89,30 +83,17 @@ struct Cli {
 enum Commands {
     /// Start a new runtime session and Chrome daemon
     Start {
-        /// Run Chrome headed (macOS uses windowless startup).
-        ///
-        /// Sauron will try to keep the window minimized/off-screen so it does not interrupt user flow.
-        #[arg(long)]
-        headed: bool,
-
-        /// Enable WebGL-friendly rendering flags (software rendering via SwiftShader).
+        /// (macOS only) Enable WebGL-friendly rendering flags (software rendering via SwiftShader).
         ///
         /// Useful when you need WebGL/canvas-heavy pages to work in headless environments.
         /// Note: SwiftShader is less secure; use only with trusted content.
-        #[arg(long)]
-        webgl: bool,
+        #[cfg(target_os = "macos")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        webgl: Option<bool>,
 
-        /// (Linux) Run headed Chrome inside Xvfb (virtual display) so no GUI window appears.
-        ///
-        /// Requires the 'Xvfb' binary to be installed and in PATH.
-        #[arg(long)]
-        xvfb: bool,
-
-        /// Enable GPU acceleration (overrides the default `--disable-gpu` behaviour).
-        ///
-        /// Note: WebGL mode (`--webgl`) automatically enables the GPU process.
-        #[arg(long)]
-        enable_gpu: bool,
+        /// Enable GPU acceleration.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        enable_gpu: Option<bool>,
     },
 
     /// Terminate the active runtime session and clean up state
@@ -149,6 +130,12 @@ enum Commands {
     Screenshot {
         #[arg(long)]
         full_page: bool,
+        /// Capture mobile/tablet/desktop screenshots in one command.
+        #[arg(long)]
+        responsive: bool,
+        /// Image quality profile.
+        #[arg(long, value_enum, default_value = "high")]
+        quality: ScreenshotQualityArg,
         #[arg(long)]
         path: Option<PathBuf>,
     },
@@ -186,7 +173,10 @@ enum Commands {
         // --- Screenshot options (only used if --screenshot is set) ---
         #[arg(long)]
         full_page: bool,
-        /// Optional file path to write the screenshot PNG.
+        /// Image quality profile for the screenshot action.
+        #[arg(long, value_enum, default_value = "high")]
+        screenshot_quality: ScreenshotQualityArg,
+        /// Optional file path to write the screenshot image.
         /// If omitted, screenshot data is returned as base64 in JSON.
         #[arg(long)]
         screenshot_path: Option<PathBuf>,
@@ -308,6 +298,62 @@ enum CompletionShell {
     Zsh,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ScreenshotQualityArg {
+    Low,
+    Medium,
+    High,
+}
+
+impl ScreenshotQualityArg {
+    fn to_browser(self) -> browser::ScreenshotQuality {
+        match self {
+            ScreenshotQualityArg::Low => browser::ScreenshotQuality::Low,
+            ScreenshotQualityArg::Medium => browser::ScreenshotQuality::Medium,
+            ScreenshotQualityArg::High => browser::ScreenshotQuality::High,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ScreenshotQualityArg::Low => "low",
+            ScreenshotQualityArg::Medium => "medium",
+            ScreenshotQualityArg::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponsivePreset {
+    name: &'static str,
+    width: u32,
+    height: u32,
+    mobile: bool,
+}
+
+fn responsive_screenshot_presets(desktop: types::Viewport) -> [ResponsivePreset; 3] {
+    [
+        ResponsivePreset {
+            name: "mobile",
+            width: 390,
+            height: 844,
+            mobile: true,
+        },
+        ResponsivePreset {
+            name: "tablet",
+            width: 820,
+            height: 1180,
+            mobile: false,
+        },
+        ResponsivePreset {
+            name: "desktop",
+            width: desktop.width,
+            height: desktop.height,
+            mobile: false,
+        },
+    ]
+}
+
 #[derive(Clone)]
 struct ActiveRuntime {
     store: RuntimeStore,
@@ -315,12 +361,8 @@ struct ActiveRuntime {
     ctx: AppContext,
 }
 
-fn build_runtime_store(cli: &Cli) -> Result<RuntimeStore, CliError> {
-    RuntimeStore::new(
-        cli.session_store,
-        cli.valkey_url.clone(),
-        cli.session_ttl_seconds,
-    )
+fn build_runtime_store() -> Result<RuntimeStore, CliError> {
+    RuntimeStore::new()
 }
 
 fn require_runtime(
@@ -446,21 +488,11 @@ fn print_cleanup_summary(stats: CleanupStats) {
     );
 }
 
-fn run_cleanup(
-    base_dir: &std::path::Path,
-    store_kind: SessionStoreKind,
-) -> Result<CleanupStats, CliError> {
-    if store_kind == SessionStoreKind::Filesystem {
-        return cleanup_stale_state(base_dir);
-    }
-    cleanup_stale_state_for_store(base_dir, store_kind)
+fn run_cleanup(base_dir: &std::path::Path) -> Result<CleanupStats, CliError> {
+    cleanup_stale_state(base_dir)
 }
 
 fn cleanup_terminate_log_artifacts(runtime: &ActiveRuntime) -> usize {
-    if runtime.store.kind() != SessionStoreKind::Filesystem {
-        return 0;
-    }
-
     let logs_dir = runtime.ctx.base_dir.join("runtime").join("logs");
     let session_id = runtime.session.session_id.as_str();
     let mut removed = 0usize;
@@ -484,6 +516,95 @@ fn cleanup_terminate_log_artifacts(runtime: &ActiveRuntime) -> usize {
     removed
 }
 
+const MAX_VIEWPORT_WIDTH: u32 = 7_680;
+const MAX_VIEWPORT_HEIGHT: u32 = 4_320;
+
+fn parse_viewport(input: &str) -> Result<types::Viewport, CliError> {
+    let normalized = input.trim().to_ascii_lowercase();
+    let Some((width_raw, height_raw)) = normalized.split_once('x') else {
+        return Err(CliError::bad_input(
+            format!("Invalid viewport '{}'", input),
+            "Use WIDTHxHEIGHT format (for example 1440x900)",
+        ));
+    };
+
+    let width = width_raw.parse::<u32>().map_err(|_| {
+        CliError::bad_input(
+            format!("Invalid viewport width '{}'", width_raw),
+            "Width must be a positive integer",
+        )
+    })?;
+    let height = height_raw.parse::<u32>().map_err(|_| {
+        CliError::bad_input(
+            format!("Invalid viewport height '{}'", height_raw),
+            "Height must be a positive integer",
+        )
+    })?;
+
+    if width == 0 || height == 0 {
+        return Err(CliError::bad_input(
+            format!("Invalid viewport '{}'", input),
+            "Viewport dimensions must be greater than zero",
+        ));
+    }
+    if width > MAX_VIEWPORT_WIDTH || height > MAX_VIEWPORT_HEIGHT {
+        return Err(CliError::bad_input(
+            format!("Viewport '{}' is too large", input),
+            format!(
+                "Maximum supported viewport is {}x{}",
+                MAX_VIEWPORT_WIDTH, MAX_VIEWPORT_HEIGHT
+            ),
+        ));
+    }
+
+    Ok(types::Viewport { width, height })
+}
+
+fn parse_optional_viewport(input: Option<&str>) -> Result<Option<types::Viewport>, CliError> {
+    input.map(parse_viewport).transpose()
+}
+
+fn screenshot_path_extension_matches(path: &std::path::Path, expected_extension: &str) -> bool {
+    let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+        return true;
+    };
+    let ext = ext.to_ascii_lowercase();
+    match expected_extension {
+        "jpg" => ext == "jpg" || ext == "jpeg",
+        "jpeg" => ext == "jpg" || ext == "jpeg",
+        other => ext == other,
+    }
+}
+
+fn path_looks_like_image_file(path: &std::path::Path) -> bool {
+    let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "webp"
+    )
+}
+
+fn validate_screenshot_output_path(
+    path: &std::path::Path,
+    expected_extension: &str,
+) -> Result<(), CliError> {
+    if screenshot_path_extension_matches(path, expected_extension) {
+        return Ok(());
+    }
+    Err(CliError::bad_input(
+        format!(
+            "Screenshot output extension mismatch for {}",
+            path.display()
+        ),
+        format!(
+            "Use a .{} output path for the selected quality profile",
+            expected_extension
+        ),
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -503,7 +624,7 @@ async fn main() {
         return;
     }
 
-    let store = match build_runtime_store(&cli) {
+    let store = match build_runtime_store() {
         Ok(store) => store,
         Err(e) => {
             eprintln!("{}", e.message);
@@ -514,15 +635,34 @@ async fn main() {
     let command = cli.command;
     let port_flag = cli.port;
     let timeout_flag = cli.timeout;
+    let viewport_override = match parse_optional_viewport(cli.viewport.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            let command_name = command_label(&command);
+            let human_output = matches!(
+                command,
+                Commands::Start { .. }
+                    | Commands::Terminate { .. }
+                    | Commands::Status
+                    | Commands::Completions { .. }
+            );
+            if human_output {
+                eprintln!("{}", e.message);
+            } else {
+                let res = make_error(command_name, &e);
+                print_result(&res);
+            }
+            std::process::exit(e.exit_code);
+        }
+    };
 
     match command {
         Commands::Start {
-            headed,
+            #[cfg(target_os = "macos")]
             webgl,
-            xvfb,
             enable_gpu,
         } => {
-            let session = match create_session_record(
+            let mut session = match create_session_record(
                 &store,
                 cli.session_id.clone(),
                 cli.instance.clone(),
@@ -536,6 +676,9 @@ async fn main() {
                     std::process::exit(e.exit_code);
                 }
             };
+            let session_viewport = viewport_override.unwrap_or_default();
+            session.viewport_width = session_viewport.width;
+            session.viewport_height = session_viewport.height;
 
             let ctx = match AppContext::new(
                 &session.instance,
@@ -551,8 +694,15 @@ async fn main() {
             };
 
             let timeout_ms = timeout_flag.unwrap_or(10_000);
-            let headless = !(headed || xvfb);
-            let disable_gpu = !(enable_gpu || webgl);
+            #[cfg(target_os = "macos")]
+            let webgl_enabled = webgl.unwrap_or(true);
+            #[cfg(not(target_os = "macos"))]
+            let webgl_enabled = false;
+
+            #[cfg(target_os = "macos")]
+            let disable_gpu = !enable_gpu.unwrap_or(true);
+            #[cfg(not(target_os = "macos"))]
+            let disable_gpu = !enable_gpu.unwrap_or(false);
             let _ = store.append_log(&session, "start", "start", None);
             match daemon::start(
                 ctx.pid_path.clone(),
@@ -561,10 +711,10 @@ async fn main() {
                 port_flag,
                 timeout_ms,
                 daemon::ChromeLaunchOptions {
-                    headless,
+                    headless: true,
                     disable_gpu,
-                    webgl,
-                    xvfb,
+                    webgl: webgl_enabled,
+                    viewport: session_viewport,
                 },
             )
             .await
@@ -604,13 +754,17 @@ async fn main() {
                         },
                         "start",
                         true,
-                        json!({ "port": r.port, "pid": r.pid, "store": format!("{:?}", store.kind()) }),
+                        json!({ "port": r.port, "pid": r.pid, "store": "filesystem" }),
                     );
                     println!("Chrome daemon started on port {} (pid: {})", r.port, r.pid);
                     println!("WebSocket: {}", r.ws_url);
                     println!("Session ID: {}", session.session_id);
                     println!("Instance ID: {}", session.instance);
                     println!("Client ID: {}", session.client);
+                    println!(
+                        "Viewport: {}x{}",
+                        session.viewport_width, session.viewport_height
+                    );
                     if let Ok(project_root) = resolve_project_root_path() {
                         println!("Project binding: {}", project_root.display());
                     }
@@ -664,7 +818,7 @@ async fn main() {
                         std::process::exit(e.exit_code);
                     }
                 };
-                match run_cleanup(&base_dir, store.kind()) {
+                match run_cleanup(&base_dir) {
                     Ok(stats) => {
                         print_cleanup_summary(stats);
                         println!("No active runtime session found. Cleanup completed.");
@@ -742,7 +896,7 @@ async fn main() {
 
             let mut cleanup_stats = None;
             if cleanup {
-                match run_cleanup(&runtime.ctx.base_dir, runtime.store.kind()) {
+                match run_cleanup(&runtime.ctx.base_dir) {
                     Ok(stats) => {
                         cleanup_stats = Some(stats);
                     }
@@ -862,24 +1016,30 @@ async fn main() {
 
                 // --- Browser commands (JSON output) ---
                 Commands::Navigate { url, wait_until } => {
-                    with_browser_command(&mut runtime, port_flag, "navigate", |page| async move {
-                        let timeout = Duration::from_millis(timeout_flag.unwrap_or(30_000));
-                        let outcome = page.navigate(&url, &wait_until, timeout).await?;
-                        #[derive(Serialize)]
-                        #[serde(rename_all = "camelCase")]
-                        struct Out {
-                            url: String,
-                            #[serde(skip_serializing_if = "Option::is_none")]
-                            status: Option<i64>,
-                        }
-                        Ok(make_success(
-                            "navigate",
-                            Out {
-                                url,
-                                status: outcome.status,
-                            },
-                        ))
-                    })
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "navigate",
+                        |page| async move {
+                            let timeout = Duration::from_millis(timeout_flag.unwrap_or(30_000));
+                            let outcome = page.navigate(&url, &wait_until, timeout).await?;
+                            #[derive(Serialize)]
+                            #[serde(rename_all = "camelCase")]
+                            struct Out {
+                                url: String,
+                                #[serde(skip_serializing_if = "Option::is_none")]
+                                status: Option<i64>,
+                            }
+                            Ok(make_success(
+                                "navigate",
+                                Out {
+                                    url,
+                                    status: outcome.status,
+                                },
+                            ))
+                        },
+                    )
                     .await;
                 }
 
@@ -890,50 +1050,168 @@ async fn main() {
                     iframes,
                 } => {
                     let cmd_ctx = ctx.clone();
-                    with_browser_command(&mut runtime, port_flag, "snapshot", move |page| {
-                        let cmd_ctx = cmd_ctx.clone();
-                        async move {
-                            let opts = types::SnapshotOptions {
-                                interactive,
-                                clickable,
-                                scope,
-                                include_iframes: iframes,
-                            };
-                            let snap = page.snapshot_and_persist(&cmd_ctx, opts).await?;
-
-                            #[derive(Serialize)]
-                            #[serde(rename_all = "camelCase")]
-                            struct Out {
-                                url: String,
-                                snapshot_id: u64,
-                                ref_count: usize,
-                                tree: String,
-                            }
-
-                            Ok(make_success(
-                                "snapshot",
-                                Out {
-                                    url: snap.url,
-                                    snapshot_id: snap.snapshot_id,
-                                    ref_count: snap.refs.len(),
-                                    tree: snap.tree,
-                                },
-                            ))
-                        }
-                    })
-                    .await;
-                }
-
-                Commands::Screenshot { full_page, path } => {
                     with_browser_command(
                         &mut runtime,
                         port_flag,
+                        viewport_override,
+                        "snapshot",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                let opts = types::SnapshotOptions {
+                                    interactive,
+                                    clickable,
+                                    scope,
+                                    include_iframes: iframes,
+                                };
+                                let snap = page.snapshot_and_persist(&cmd_ctx, opts).await?;
+
+                                #[derive(Serialize)]
+                                #[serde(rename_all = "camelCase")]
+                                struct Out {
+                                    url: String,
+                                    snapshot_id: u64,
+                                    ref_count: usize,
+                                    tree: String,
+                                }
+
+                                Ok(make_success(
+                                    "snapshot",
+                                    Out {
+                                        url: snap.url,
+                                        snapshot_id: snap.snapshot_id,
+                                        ref_count: snap.refs.len(),
+                                        tree: snap.tree,
+                                    },
+                                ))
+                            }
+                        },
+                    )
+                    .await;
+                }
+
+                Commands::Screenshot {
+                    full_page,
+                    responsive,
+                    quality,
+                    path,
+                } => {
+                    let responsive_desktop =
+                        viewport_override.unwrap_or(runtime.session.viewport());
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
                         "screenshot",
                         |page| async move {
-                            let data = page.capture_screenshot(full_page).await?;
-                            if let Some(p) = path {
+                            let quality_profile = quality.to_browser();
+
+                            if responsive {
+                                let output_dir = if let Some(p) = path {
+                                    if p.exists() {
+                                        let meta = std::fs::metadata(&p).map_err(|e| {
+                                            CliError::unknown(
+                                                format!(
+                                                    "Failed to inspect screenshot path {}: {}",
+                                                    p.display(),
+                                                    e
+                                                ),
+                                                "Check filesystem permissions",
+                                            )
+                                        })?;
+                                        if !meta.is_dir() {
+                                            return Err(CliError::bad_input(
+                                                format!(
+                                                    "Responsive screenshots require a directory path, got file: {}",
+                                                    p.display()
+                                                ),
+                                                "Use --path <directory> when --responsive is set",
+                                            ));
+                                        }
+                                    } else if path_looks_like_image_file(&p) {
+                                        return Err(CliError::bad_input(
+                                            format!(
+                                                "Responsive screenshots require a directory path, got file-like path: {}",
+                                                p.display()
+                                            ),
+                                            "Use --path <directory> when --responsive is set",
+                                        ));
+                                    }
+                                    p
+                                } else {
+                                    std::env::current_dir().map_err(|e| {
+                                        CliError::unknown(
+                                            format!(
+                                                "Failed to resolve current directory for screenshots: {}",
+                                                e
+                                            ),
+                                            "Run the command from an accessible directory",
+                                        )
+                                    })?
+                                };
+
+                                tokio::fs::create_dir_all(&output_dir).await.map_err(|e| {
+                                    CliError::unknown(
+                                        format!(
+                                            "Failed to create screenshot directory {}: {}",
+                                            output_dir.display(),
+                                            e
+                                        ),
+                                        "Check filesystem permissions",
+                                    )
+                                })?;
+
+                                let mut screenshots: Vec<serde_json::Value> = Vec::new();
+                                for preset in responsive_screenshot_presets(responsive_desktop) {
+                                    page.set_viewport(preset.width, preset.height, preset.mobile)
+                                        .await?;
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    let shot =
+                                        page.capture_screenshot(full_page, quality_profile).await?;
+                                    let file_name =
+                                        format!("screenshot-{}.{}", preset.name, shot.extension);
+                                    let file_path = output_dir.join(file_name);
+                                    let bytes = base64::engine::general_purpose::STANDARD
+                                        .decode(&shot.data)
+                                        .map_err(|e| {
+                                            CliError::unknown(
+                                                format!("Invalid base64 screenshot: {}", e),
+                                                "This should not happen",
+                                            )
+                                        })?;
+                                    tokio::fs::write(&file_path, bytes).await.map_err(|e| {
+                                        CliError::unknown(
+                                            format!(
+                                                "Failed to write screenshot to {}: {}",
+                                                file_path.display(),
+                                                e
+                                            ),
+                                            "Check filesystem permissions",
+                                        )
+                                    })?;
+                                    screenshots.push(json!({
+                                        "preset": preset.name,
+                                        "width": preset.width,
+                                        "height": preset.height,
+                                        "path": file_path.to_string_lossy(),
+                                        "saved": true,
+                                        "mime": shot.mime
+                                    }));
+                                }
+
+                                Ok(make_success(
+                                    "screenshot",
+                                    json!({
+                                        "responsive": true,
+                                        "quality": quality.as_str(),
+                                        "screenshots": screenshots
+                                    }),
+                                ))
+                            } else if let Some(p) = path {
+                                let shot = page.capture_screenshot(full_page, quality_profile).await?;
+                                validate_screenshot_output_path(&p, shot.extension.as_str())?;
                                 let bytes = base64::engine::general_purpose::STANDARD
-                                    .decode(&data)
+                                    .decode(&shot.data)
                                     .map_err(|e| {
                                         CliError::unknown(
                                             format!("Invalid base64 screenshot: {}", e),
@@ -952,12 +1230,22 @@ async fn main() {
                                 })?;
                                 Ok(make_success(
                                     "screenshot",
-                                    json!({ "saved": true, "path": p.to_string_lossy() }),
+                                    json!({
+                                        "saved": true,
+                                        "path": p.to_string_lossy(),
+                                        "mime": shot.mime,
+                                        "quality": quality.as_str()
+                                    }),
                                 ))
                             } else {
+                                let shot = page.capture_screenshot(full_page, quality_profile).await?;
                                 Ok(make_success(
                                     "screenshot",
-                                    json!({ "data": data, "mime": "image/png" }),
+                                    json!({
+                                        "data": shot.data,
+                                        "mime": shot.mime,
+                                        "quality": quality.as_str()
+                                    }),
                                 ))
                             }
                         },
@@ -966,14 +1254,20 @@ async fn main() {
                 }
 
                 Commands::Content => {
-                    with_browser_command(&mut runtime, port_flag, "content", |page| async move {
-                        let url = page.url().await?;
-                        let markdown = page.extract_markdown().await?;
-                        Ok(make_success(
-                            "content",
-                            json!({ "url": url, "markdown": markdown }),
-                        ))
-                    })
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "content",
+                        |page| async move {
+                            let url = page.url().await?;
+                            let markdown = page.extract_markdown().await?;
+                            Ok(make_success(
+                                "content",
+                                json!({ "url": url, "markdown": markdown }),
+                            ))
+                        },
+                    )
                     .await;
                 }
 
@@ -986,190 +1280,212 @@ async fn main() {
                     scope,
                     iframes,
                     full_page,
+                    screenshot_quality,
                     screenshot_path,
                 } => {
                     let cmd_ctx = ctx.clone();
-                    with_browser_command(&mut runtime, port_flag, "collect", move |page| {
-                        let cmd_ctx = cmd_ctx.clone();
-                        async move {
-                            if !(snapshot || screenshot || content) {
-                                return Err(CliError::bad_input(
-                                    "collect requires at least one action flag",
-                                    "Use one or more of: --snapshot, --screenshot, --content",
-                                ));
-                            }
-
-                            let page_for_url = page.clone();
-                            let url_fut = async move { page_for_url.url().await.ok() };
-
-                            let page_for_snapshot = page.clone();
-                            let cmd_ctx_for_snapshot = cmd_ctx.clone();
-                            let scope_for_snapshot = scope.clone();
-                            let snapshot_fut = async move {
-                                if !snapshot {
-                                    return Ok::<Option<serde_json::Value>, CliError>(None);
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "collect",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                if !(snapshot || screenshot || content) {
+                                    return Err(CliError::bad_input(
+                                        "collect requires at least one action flag",
+                                        "Use one or more of: --snapshot, --screenshot, --content",
+                                    ));
                                 }
-                                let opts = types::SnapshotOptions {
-                                    interactive,
-                                    clickable,
-                                    scope: scope_for_snapshot,
-                                    include_iframes: iframes,
+
+                                let page_for_url = page.clone();
+                                let url_fut = async move { page_for_url.url().await.ok() };
+
+                                let page_for_snapshot = page.clone();
+                                let cmd_ctx_for_snapshot = cmd_ctx.clone();
+                                let scope_for_snapshot = scope.clone();
+                                let snapshot_fut = async move {
+                                    if !snapshot {
+                                        return Ok::<Option<serde_json::Value>, CliError>(None);
+                                    }
+                                    let opts = types::SnapshotOptions {
+                                        interactive,
+                                        clickable,
+                                        scope: scope_for_snapshot,
+                                        include_iframes: iframes,
+                                    };
+                                    let snap = page_for_snapshot
+                                        .snapshot_and_persist(&cmd_ctx_for_snapshot, opts)
+                                        .await?;
+                                    Ok(Some(json!({
+                                        "url": snap.url,
+                                        "snapshotId": snap.snapshot_id,
+                                        "refCount": snap.refs.len(),
+                                        "tree": snap.tree
+                                    })))
                                 };
-                                let snap = page_for_snapshot
-                                    .snapshot_and_persist(&cmd_ctx_for_snapshot, opts)
-                                    .await?;
-                                Ok(Some(json!({
-                                    "url": snap.url,
-                                    "snapshotId": snap.snapshot_id,
-                                    "refCount": snap.refs.len(),
-                                    "tree": snap.tree
-                                })))
-                            };
 
-                            let page_for_screenshot = page.clone();
-                            let screenshot_path_for_task = screenshot_path.clone();
-                            let screenshot_fut = async move {
-                                if !screenshot {
-                                    return Ok::<Option<serde_json::Value>, CliError>(None);
-                                }
-                                let data =
-                                    page_for_screenshot.capture_screenshot(full_page).await?;
-                                if let Some(p) = screenshot_path_for_task {
-                                    let bytes = base64::engine::general_purpose::STANDARD
-                                        .decode(&data)
-                                        .map_err(|e| {
+                                let page_for_screenshot = page.clone();
+                                let screenshot_path_for_task = screenshot_path.clone();
+                                let screenshot_quality_for_task = screenshot_quality.to_browser();
+                                let screenshot_fut = async move {
+                                    if !screenshot {
+                                        return Ok::<Option<serde_json::Value>, CliError>(None);
+                                    }
+                                    let shot = page_for_screenshot
+                                        .capture_screenshot(full_page, screenshot_quality_for_task)
+                                        .await?;
+                                    if let Some(p) = screenshot_path_for_task {
+                                        validate_screenshot_output_path(
+                                            &p,
+                                            shot.extension.as_str(),
+                                        )?;
+                                        let bytes = base64::engine::general_purpose::STANDARD
+                                            .decode(&shot.data)
+                                            .map_err(|e| {
+                                                CliError::unknown(
+                                                    format!("Invalid base64 screenshot: {}", e),
+                                                    "This should not happen",
+                                                )
+                                            })?;
+                                        tokio::fs::write(&p, bytes).await.map_err(|e| {
                                             CliError::unknown(
-                                                format!("Invalid base64 screenshot: {}", e),
-                                                "This should not happen",
+                                                format!(
+                                                    "Failed to write screenshot to {}: {}",
+                                                    p.display(),
+                                                    e
+                                                ),
+                                                "Check filesystem permissions",
                                             )
                                         })?;
-                                    tokio::fs::write(&p, bytes).await.map_err(|e| {
-                                        CliError::unknown(
-                                            format!(
-                                                "Failed to write screenshot to {}: {}",
-                                                p.display(),
-                                                e
-                                            ),
-                                            "Check filesystem permissions",
-                                        )
-                                    })?;
-                                    Ok(Some(json!({
-                                        "saved": true,
-                                        "path": p.to_string_lossy(),
-                                        "mime": "image/png"
-                                    })))
-                                } else {
-                                    Ok(Some(json!({ "data": data, "mime": "image/png" })))
-                                }
-                            };
-
-                            let page_for_content = page.clone();
-                            let content_fut = async move {
-                                if !content {
-                                    return Ok::<Option<String>, CliError>(None);
-                                }
-                                let markdown = page_for_content.extract_markdown().await?;
-                                Ok(Some(markdown))
-                            };
-
-                            let (url_opt, snap_res, shot_res, content_res) =
-                                tokio::join!(url_fut, snapshot_fut, screenshot_fut, content_fut);
-
-                            let mut errors: Vec<serde_json::Value> = Vec::new();
-                            let mut first_error: Option<CliError> = None;
-
-                            let snapshot_out = match snap_res {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    if first_error.is_none() {
-                                        first_error = Some(e.clone());
+                                        Ok(Some(json!({
+                                            "saved": true,
+                                            "path": p.to_string_lossy(),
+                                            "mime": shot.mime,
+                                            "quality": screenshot_quality.as_str()
+                                        })))
+                                    } else {
+                                        Ok(Some(json!({
+                                            "data": shot.data,
+                                            "mime": shot.mime,
+                                            "quality": screenshot_quality.as_str()
+                                        })))
                                     }
-                                    errors.push(json!({
-                                        "action": "snapshot",
-                                        "code": e.code,
-                                        "message": e.message,
-                                        "hint": e.hint,
-                                        "recoverable": e.recoverable
-                                    }));
-                                    None
-                                }
-                            };
+                                };
 
-                            let screenshot_out = match shot_res {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    if first_error.is_none() {
-                                        first_error = Some(e.clone());
+                                let page_for_content = page.clone();
+                                let content_fut = async move {
+                                    if !content {
+                                        return Ok::<Option<String>, CliError>(None);
                                     }
-                                    errors.push(json!({
-                                        "action": "screenshot",
-                                        "code": e.code,
-                                        "message": e.message,
-                                        "hint": e.hint,
-                                        "recoverable": e.recoverable
-                                    }));
-                                    None
-                                }
-                            };
+                                    let markdown = page_for_content.extract_markdown().await?;
+                                    Ok(Some(markdown))
+                                };
 
-                            let content_out = match content_res {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    if first_error.is_none() {
-                                        first_error = Some(e.clone());
+                                let (url_opt, snap_res, shot_res, content_res) = tokio::join!(
+                                    url_fut,
+                                    snapshot_fut,
+                                    screenshot_fut,
+                                    content_fut
+                                );
+
+                                let mut errors: Vec<serde_json::Value> = Vec::new();
+                                let mut first_error: Option<CliError> = None;
+
+                                let snapshot_out = match snap_res {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        if first_error.is_none() {
+                                            first_error = Some(e.clone());
+                                        }
+                                        errors.push(json!({
+                                            "action": "snapshot",
+                                            "code": e.code,
+                                            "message": e.message,
+                                            "hint": e.hint,
+                                            "recoverable": e.recoverable
+                                        }));
+                                        None
                                     }
-                                    errors.push(json!({
-                                        "action": "content",
-                                        "code": e.code,
-                                        "message": e.message,
-                                        "hint": e.hint,
-                                        "recoverable": e.recoverable
-                                    }));
-                                    None
-                                }
-                            };
+                                };
 
-                            let any_success = snapshot_out.is_some()
-                                || screenshot_out.is_some()
-                                || content_out.is_some();
+                                let screenshot_out = match shot_res {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        if first_error.is_none() {
+                                            first_error = Some(e.clone());
+                                        }
+                                        errors.push(json!({
+                                            "action": "screenshot",
+                                            "code": e.code,
+                                            "message": e.message,
+                                            "hint": e.hint,
+                                            "recoverable": e.recoverable
+                                        }));
+                                        None
+                                    }
+                                };
 
-                            if !any_success {
-                                if let Some(e) = first_error {
-                                    return Err(e);
-                                }
-                                return Err(CliError::unknown(
+                                let content_out = match content_res {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        if first_error.is_none() {
+                                            first_error = Some(e.clone());
+                                        }
+                                        errors.push(json!({
+                                            "action": "content",
+                                            "code": e.code,
+                                            "message": e.message,
+                                            "hint": e.hint,
+                                            "recoverable": e.recoverable
+                                        }));
+                                        None
+                                    }
+                                };
+
+                                let any_success = snapshot_out.is_some()
+                                    || screenshot_out.is_some()
+                                    || content_out.is_some();
+
+                                if !any_success {
+                                    if let Some(e) = first_error {
+                                        return Err(e);
+                                    }
+                                    return Err(CliError::unknown(
                                     "collect failed",
                                     "Try running the actions individually to isolate the failure",
                                 ));
-                            }
+                                }
 
-                            #[derive(Serialize)]
-                            #[serde(rename_all = "camelCase")]
-                            struct Out {
-                                #[serde(skip_serializing_if = "Option::is_none")]
-                                url: Option<String>,
-                                #[serde(skip_serializing_if = "Option::is_none")]
-                                snapshot: Option<serde_json::Value>,
-                                #[serde(skip_serializing_if = "Option::is_none")]
-                                screenshot: Option<serde_json::Value>,
-                                #[serde(skip_serializing_if = "Option::is_none")]
-                                content: Option<String>,
-                                #[serde(skip_serializing_if = "Vec::is_empty", default)]
-                                errors: Vec<serde_json::Value>,
-                            }
+                                #[derive(Serialize)]
+                                #[serde(rename_all = "camelCase")]
+                                struct Out {
+                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                    url: Option<String>,
+                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                    snapshot: Option<serde_json::Value>,
+                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                    screenshot: Option<serde_json::Value>,
+                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                    content: Option<String>,
+                                    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+                                    errors: Vec<serde_json::Value>,
+                                }
 
-                            Ok(make_success(
-                                "collect",
-                                Out {
-                                    url: url_opt,
-                                    snapshot: snapshot_out,
-                                    screenshot: screenshot_out,
-                                    content: content_out,
-                                    errors,
-                                },
-                            ))
-                        }
-                    })
+                                Ok(make_success(
+                                    "collect",
+                                    Out {
+                                        url: url_opt,
+                                        snapshot: snapshot_out,
+                                        screenshot: screenshot_out,
+                                        content: content_out,
+                                        errors,
+                                    },
+                                ))
+                            }
+                        },
+                    )
                     .await;
                 }
 
@@ -1179,66 +1495,90 @@ async fn main() {
                     nth,
                 } => {
                     let cmd_ctx = ctx.clone();
-                    with_browser_command(&mut runtime, port_flag, "click", move |page| {
-                        let cmd_ctx = cmd_ctx.clone();
-                        async move {
-                            let backend = page
-                                .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
-                                .await?;
-                            page.click(backend, double).await?;
-                            Ok(make_success(
-                                "click",
-                                json!({ "target": target, "clicked": true, "double": double }),
-                            ))
-                        }
-                    })
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "click",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                let backend = page
+                                    .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
+                                    .await?;
+                                page.click(backend, double).await?;
+                                Ok(make_success(
+                                    "click",
+                                    json!({ "target": target, "clicked": true, "double": double }),
+                                ))
+                            }
+                        },
+                    )
                     .await;
                 }
 
                 Commands::Fill { target, text, nth } => {
                     let cmd_ctx = ctx.clone();
-                    with_browser_command(&mut runtime, port_flag, "fill", move |page| {
-                        let cmd_ctx = cmd_ctx.clone();
-                        async move {
-                            let backend = page
-                                .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
-                                .await?;
-                            let typ = page.fill(backend, &text).await?;
-                            Ok(make_success(
-                                "fill",
-                                json!({ "target": target, "filled": true, "type": typ }),
-                            ))
-                        }
-                    })
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "fill",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                let backend = page
+                                    .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
+                                    .await?;
+                                let typ = page.fill(backend, &text).await?;
+                                Ok(make_success(
+                                    "fill",
+                                    json!({ "target": target, "filled": true, "type": typ }),
+                                ))
+                            }
+                        },
+                    )
                     .await;
                 }
 
                 Commands::Key { combo } => {
-                    with_browser_command(&mut runtime, port_flag, "key", |page| async move {
-                        page.press_key(&combo).await?;
-                        Ok(make_success(
-                            "key",
-                            json!({ "key": combo, "pressed": true }),
-                        ))
-                    })
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "key",
+                        |page| async move {
+                            page.press_key(&combo).await?;
+                            Ok(make_success(
+                                "key",
+                                json!({ "key": combo, "pressed": true }),
+                            ))
+                        },
+                    )
                     .await;
                 }
 
                 Commands::Hover { target, nth } => {
                     let cmd_ctx = ctx.clone();
-                    with_browser_command(&mut runtime, port_flag, "hover", move |page| {
-                        let cmd_ctx = cmd_ctx.clone();
-                        async move {
-                            let backend = page
-                                .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
-                                .await?;
-                            page.hover(backend).await?;
-                            Ok(make_success(
-                                "hover",
-                                json!({ "target": target, "hovered": true }),
-                            ))
-                        }
-                    })
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "hover",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                let backend = page
+                                    .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
+                                    .await?;
+                                page.hover(backend).await?;
+                                Ok(make_success(
+                                    "hover",
+                                    json!({ "target": target, "hovered": true }),
+                                ))
+                            }
+                        },
+                    )
                     .await;
                 }
 
@@ -1248,37 +1588,44 @@ async fn main() {
                     nth,
                 } => {
                     let cmd_ctx = ctx.clone();
-                    with_browser_command(&mut runtime, port_flag, "scroll", move |page| {
-                        let cmd_ctx = cmd_ctx.clone();
-                        async move {
-                            let dir = target.to_lowercase();
-                            if matches!(dir.as_str(), "up" | "down" | "top" | "bottom") {
-                                let expr = match dir.as_str() {
-                                    "top" => "window.scrollTo(0, 0)".to_string(),
-                                    "bottom" => {
-                                        "window.scrollTo(0, document.body.scrollHeight)".to_string()
-                                    }
-                                    "up" => format!("window.scrollBy(0, -{})", amount),
-                                    "down" => format!("window.scrollBy(0, {})", amount),
-                                    _ => format!("window.scrollBy(0, {})", amount),
-                                };
-                                let _ = page.eval(&expr).await?;
-                                Ok(make_success(
-                                    "scroll",
-                                    json!({ "direction": dir, "amount": amount }),
-                                ))
-                            } else {
-                                let backend = page
-                                    .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
-                                    .await?;
-                                page.scroll_into_view(backend).await?;
-                                Ok(make_success(
-                                    "scroll",
-                                    json!({ "target": target, "scrolledIntoView": true }),
-                                ))
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "scroll",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                let dir = target.to_lowercase();
+                                if matches!(dir.as_str(), "up" | "down" | "top" | "bottom") {
+                                    let expr = match dir.as_str() {
+                                        "top" => "window.scrollTo(0, 0)".to_string(),
+                                        "bottom" => {
+                                            "window.scrollTo(0, document.body.scrollHeight)"
+                                                .to_string()
+                                        }
+                                        "up" => format!("window.scrollBy(0, -{})", amount),
+                                        "down" => format!("window.scrollBy(0, {})", amount),
+                                        _ => format!("window.scrollBy(0, {})", amount),
+                                    };
+                                    let _ = page.eval(&expr).await?;
+                                    Ok(make_success(
+                                        "scroll",
+                                        json!({ "direction": dir, "amount": amount }),
+                                    ))
+                                } else {
+                                    let backend = page
+                                        .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
+                                        .await?;
+                                    page.scroll_into_view(backend).await?;
+                                    Ok(make_success(
+                                        "scroll",
+                                        json!({ "target": target, "scrolledIntoView": true }),
+                                    ))
+                                }
                             }
-                        }
-                    })
+                        },
+                    )
                     .await;
                 }
 
@@ -1289,91 +1636,115 @@ async fn main() {
                     selector,
                     idle,
                 } => {
-                    with_browser_command(&mut runtime, port_flag, "wait", |page| async move {
-                        let timeout = Duration::from_millis(timeout_flag.unwrap_or(30_000));
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "wait",
+                        |page| async move {
+                            let timeout = Duration::from_millis(timeout_flag.unwrap_or(30_000));
 
-                        if let Some(ms) = duration {
-                            tokio::time::sleep(Duration::from_millis(ms)).await;
-                            return Ok(make_success(
-                                "wait",
-                                json!({ "waited": true, "duration": ms }),
-                            ));
-                        }
-                        if let Some(t) = text {
-                            page.wait_for_text(&t, timeout).await?;
-                            return Ok(make_success("wait", json!({ "waited": true, "text": t })));
-                        }
-                        if let Some(u) = url {
-                            page.wait_for_url(&u, timeout).await?;
-                            return Ok(make_success("wait", json!({ "waited": true, "url": u })));
-                        }
-                        if let Some(sel) = selector {
-                            page.wait_for_selector(&sel, timeout).await?;
-                            return Ok(make_success(
-                                "wait",
-                                json!({ "waited": true, "selector": sel }),
-                            ));
-                        }
-                        if idle {
-                            page.wait_for_idle(timeout).await?;
-                            return Ok(make_success(
-                                "wait",
-                                json!({ "waited": true, "idle": true }),
-                            ));
-                        }
+                            if let Some(ms) = duration {
+                                tokio::time::sleep(Duration::from_millis(ms)).await;
+                                return Ok(make_success(
+                                    "wait",
+                                    json!({ "waited": true, "duration": ms }),
+                                ));
+                            }
+                            if let Some(t) = text {
+                                page.wait_for_text(&t, timeout).await?;
+                                return Ok(make_success(
+                                    "wait",
+                                    json!({ "waited": true, "text": t }),
+                                ));
+                            }
+                            if let Some(u) = url {
+                                page.wait_for_url(&u, timeout).await?;
+                                return Ok(make_success(
+                                    "wait",
+                                    json!({ "waited": true, "url": u }),
+                                ));
+                            }
+                            if let Some(sel) = selector {
+                                page.wait_for_selector(&sel, timeout).await?;
+                                return Ok(make_success(
+                                    "wait",
+                                    json!({ "waited": true, "selector": sel }),
+                                ));
+                            }
+                            if idle {
+                                page.wait_for_idle(timeout).await?;
+                                return Ok(make_success(
+                                    "wait",
+                                    json!({ "waited": true, "idle": true }),
+                                ));
+                            }
 
-                        Err(CliError::bad_input(
-                            "No wait condition provided",
-                            "Provide a duration (ms) or one of --text/--url/--selector/--idle",
-                        ))
-                    })
+                            Err(CliError::bad_input(
+                                "No wait condition provided",
+                                "Provide a duration (ms) or one of --text/--url/--selector/--idle",
+                            ))
+                        },
+                    )
                     .await;
                 }
 
                 Commands::Dialog { action, text } => {
-                    with_browser_command(&mut runtime, port_flag, "dialog", |page| async move {
-                        let timeout = Duration::from_millis(2_000);
-                        let d = page.next_dialog(timeout).await?;
-                        let Some(d) = d else {
-                            return Err(CliError::new(
-                                types::ErrorCode::Timeout,
-                                "No dialog appeared within 2000ms".to_string(),
-                                "Trigger the dialog before running this command",
-                                true,
-                                1,
-                            ));
-                        };
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "dialog",
+                        |page| async move {
+                            let timeout = Duration::from_millis(2_000);
+                            let d = page.next_dialog(timeout).await?;
+                            let Some(d) = d else {
+                                return Err(CliError::new(
+                                    types::ErrorCode::Timeout,
+                                    "No dialog appeared within 2000ms".to_string(),
+                                    "Trigger the dialog before running this command",
+                                    true,
+                                    1,
+                                ));
+                            };
 
-                        let accept = match action.as_str() {
-                            "accept" => true,
-                            "dismiss" => false,
-                            _ => {
-                                return Err(CliError::bad_input(
-                                    "Invalid dialog action",
-                                    "Use 'accept' or 'dismiss'",
-                                ))
-                            }
-                        };
+                            let accept = match action.as_str() {
+                                "accept" => true,
+                                "dismiss" => false,
+                                _ => {
+                                    return Err(CliError::bad_input(
+                                        "Invalid dialog action",
+                                        "Use 'accept' or 'dismiss'",
+                                    ))
+                                }
+                            };
 
-                        page.handle_dialog(accept, text.as_deref()).await?;
-                        Ok(make_success(
-                            "dialog",
-                            json!({
-                                "action": action,
-                                "type": d.dialog_type,
-                                "message": d.message,
-                                "text": text
-                            }),
-                        ))
-                    })
+                            page.handle_dialog(accept, text.as_deref()).await?;
+                            Ok(make_success(
+                                "dialog",
+                                json!({
+                                    "action": action,
+                                    "type": d.dialog_type,
+                                    "message": d.message,
+                                    "text": text
+                                }),
+                            ))
+                        },
+                    )
                     .await;
                 }
 
                 Commands::Eval { expression } => {
-                    with_browser_command(&mut runtime, port_flag, "eval", |page| async move {
-                        let value = page.eval(&expression).await?;
-                        Ok(make_success("eval", json!({ "result": value })))
-                    })
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "eval",
+                        |page| async move {
+                            let value = page.eval(&expression).await?;
+                            Ok(make_success("eval", json!({ "result": value })))
+                        },
+                    )
                     .await;
                 }
 
@@ -1615,7 +1986,7 @@ async fn main() {
 
                 Commands::Session { command } => {
                     let cmd_ctx = ctx.clone();
-                    with_browser_command(&mut runtime, port_flag, "session", move |page| {
+                    with_browser_command(&mut runtime, port_flag, viewport_override, "session", move |page| {
                         let cmd_ctx = cmd_ctx.clone();
                         async move {
                             match command {
@@ -1673,6 +2044,7 @@ async fn main() {
 async fn with_browser_command<F, Fut, T>(
     runtime: &mut ActiveRuntime,
     port_flag: Option<u16>,
+    viewport_override: Option<types::Viewport>,
     command_name: &'static str,
     f: F,
 ) where
@@ -1719,6 +2091,23 @@ async fn with_browser_command<F, Fut, T>(
             std::process::exit(e.exit_code);
         }
     };
+
+    let viewport = viewport_override.unwrap_or(runtime.session.viewport());
+    if let Err(e) = page
+        .set_viewport(viewport.width, viewport.height, false)
+        .await
+    {
+        let code = serde_json::to_value(e.code).unwrap_or(json!("UNKNOWN"));
+        finish_runtime_command(
+            runtime,
+            command_name,
+            false,
+            json!({ "errorCode": code, "message": e.message }),
+        );
+        let res = make_error(command_name, &e);
+        print_result(&res);
+        std::process::exit(e.exit_code);
+    }
 
     match f(page).await {
         Ok(res) => {
@@ -1828,5 +2217,24 @@ mod tests {
             types::ErrorCode::BadInput,
             true,
         ));
+    }
+
+    #[test]
+    fn parse_viewport_accepts_valid_dimensions() {
+        let viewport = parse_viewport("1440x900").expect("viewport should parse");
+        assert_eq!(viewport.width, 1440);
+        assert_eq!(viewport.height, 900);
+    }
+
+    #[test]
+    fn parse_viewport_rejects_bad_format() {
+        let err = parse_viewport("1440-900").expect_err("viewport should fail");
+        assert!(matches!(err.code, types::ErrorCode::BadInput));
+    }
+
+    #[test]
+    fn parse_viewport_rejects_zero_dimension() {
+        let err = parse_viewport("0x900").expect_err("viewport should fail");
+        assert!(matches!(err.code, types::ErrorCode::BadInput));
     }
 }
