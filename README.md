@@ -17,10 +17,35 @@ This is a rewrite of the attached Bun/TypeScript `sauron` project as a compiled 
 ## Install
 
 ```bash
+./install.sh
+```
+
+By default, `install.sh`:
+- builds and installs for your host target to `/usr/local/bin/sauron`,
+- attempts to build the release matrix for:
+  - `aarch64-apple-darwin`
+  - `x86_64-apple-darwin`
+  - `x86_64-unknown-linux-gnu`
+
+Notes:
+- Linux cross-builds from non-Linux hosts require `zig` and `cargo-zigbuild`.
+- Missing cross-toolchain prerequisites are reported as warnings and skipped; host install still succeeds.
+
+Useful options:
+
+```bash
+./install.sh --no-matrix                     # host-only build + install
+./install.sh --prefix "$HOME/.local"         # install under custom prefix
+./install.sh --windows                       # best-effort Windows build too
+```
+
+If you prefer the old local cargo install workflow:
+
+```bash
 cargo install --path .
 ```
 
-Or run in-place:
+Or run in place:
 
 ```bash
 cargo run -- --help
