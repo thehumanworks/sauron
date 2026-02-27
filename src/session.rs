@@ -122,7 +122,7 @@ pub async fn load_session(
         if e.kind() == std::io::ErrorKind::NotFound {
             CliError::bad_input(
                 format!("Session not found: {}", name),
-                "Use 'sauron session list' to see available sessions",
+                "Use 'sauron state list' to see available sessions",
             )
         } else {
             CliError::unknown(

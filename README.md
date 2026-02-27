@@ -6,13 +6,19 @@ This is a rewrite of the attached Bun/TypeScript `sauron` project as a compiled 
 
 ## Goals
 
-- **Agent-friendly** JSON output for all browser-facing commands
+- **Agent-friendly** JSON output for all commands (v2 envelope)
 - **Fast** startup and execution (single static-ish binary)
 - **Process-safe concurrency** with mandatory runtime sessions (`start` before browser commands)
 - **Per-session isolation** with generated `session_id`, `instance`, and `client` IDs by default
 - Filesystem-only runtime state storage under `~/.sauron/runtime/`
 - Uses Chrome **`--headless=new`** only (opinionated headless runtime)
 - Default viewport is **1440x900** (override with `--viewport WIDTHxHEIGHT`)
+
+## V2 Interface
+
+- `v2` is the only supported interface.
+- No backward compatibility layer for v1 command names or output shape.
+- Migration and implementation notes: [specs/v2-integration.md](/Users/mish/projects/sauron/specs/v2-integration.md)
 
 ## Install
 
@@ -56,38 +62,29 @@ cargo run -- --help
 Each shell/process must start a runtime session first:
 
 ```bash
-sauron start
+sauron runtime start
 ```
 
-macOS defaults to GPU + WebGL rendering flags on `start` (opt out with `--webgl=false --enable-gpu=false`).
-
-`start` prints:
-
-- Session ID
-- Generated instance ID
-- Generated client ID
-- Project binding confirmation (no export needed)
+macOS defaults to GPU + WebGL on `runtime start` (opt out with `--no-webgl --no-gpu`).
 
 Then run browser commands from the same project directory:
 
 ```bash
-sauron navigate https://example.com
-sauron snapshot
-sauron click @e1
-sauron screenshot --responsive --quality medium
+sauron page goto https://example.com
+sauron page snapshot --format json
+sauron input click --ref @e1
+sauron page screenshot --responsive --quality medium
 ```
 
 Clean up with:
 
 ```bash
-sauron terminate
+sauron runtime stop
 ```
-
-(`sauron stop` is an alias for `sauron terminate`.)
 
 ## Mandatory session lifecycle
 
-- Non-`start` commands require an active runtime session.
+- Non-`runtime start` commands require an active runtime session.
 - Session resolution order is:
   - explicit `--session-id`
   - current process binding
@@ -101,7 +98,43 @@ sauron terminate
 - You can still override IDs:
 
 ```bash
-sauron --session-id mysession --instance work --client alice start
+sauron --session-id mysession --instance work --client alice runtime start
+```
+
+## Interaction Flow
+
+```mermaid
+flowchart TD
+  U["User or AI Agent"] --> CLI["sauron CLI"]
+  CLI --> L["Lifecycle Command"]
+  CLI --> B["Browser Command"]
+  L --> R["Runtime Store"]
+  L --> D["Chrome Daemon"]
+  B --> RS["Resolve Active Session"]
+  RS --> R
+  B --> P["Page and Browser Client"]
+  P --> C["CDP Transport"]
+  C --> CH["Chrome DevTools Endpoint"]
+  B --> O["JSON Result Envelope"]
+  O --> U
+```
+
+## Component Data Flow
+
+```mermaid
+flowchart LR
+  M["CLI Router (main.rs)"] --> RT["Runtime and Session Resolution (runtime.rs)"]
+  M --> DM["Daemon Control (daemon.rs)"]
+  M --> BR["Browser Actions (browser.rs)"]
+  BR --> CDP["CDP Client (cdp.rs)"]
+  CDP --> CH["Chrome"]
+  RT --> FS["Runtime Filesystem Store"]
+  BR --> SNAP["Snapshot and Ref State"]
+  BR --> SES["Saved Browser State Sessions"]
+  BR --> LOG["Command Logs"]
+  SNAP --> FS
+  SES --> FS
+  LOG --> FS
 ```
 
 ## Concurrent session workflow
@@ -109,17 +142,17 @@ sauron --session-id mysession --instance work --client alice start
 Terminal A:
 
 ```bash
-sauron start
-sauron navigate https://example.com
-sauron session save logged-in
+sauron runtime start
+sauron page goto https://example.com
+sauron state save logged-in
 ```
 
 Terminal B (independent shell/process):
 
 ```bash
-sauron start
-sauron navigate https://news.ycombinator.com
-sauron session save baseline
+sauron runtime start
+sauron page goto https://news.ycombinator.com
+sauron state save baseline
 ```
 
 Both sessions are isolated and can run concurrently without conflicts.
@@ -147,33 +180,50 @@ Each line includes timestamp, session metadata, command name, status, and error 
 Global flags (`--session-id`, `--port`, etc.) must be placed before the subcommand:
 
 ```bash
-sauron --session-id mysession navigate https://example.com
+sauron --session-id mysession page goto https://example.com
 ```
 
 `--viewport` is global and applies to `start` and browser commands:
 
 ```bash
-sauron --viewport 1440x900 start
-sauron --viewport 390x844 screenshot
+sauron --viewport 1440x900 runtime start
+sauron --viewport 390x844 page screenshot
 ```
 
 ## Output contract
 
-All **browser commands** emit exactly one JSON object to stdout:
+All commands return exactly one JSON object in a unified v2 envelope:
 
 - Success:
 
 ```json
-{ "ok": true, "command": "snapshot", "data": { /* ... */ } }
+{
+  "v": 2,
+  "meta": { "requestId": "...", "timestamp": "...", "durationMs": 12 },
+  "result": { "ok": true, "command": "page.snapshot", "data": { /* ... */ } }
+}
 ```
 
 - Error:
 
 ```json
-{ "ok": false, "command": "click", "error": { "code": "ELEMENT_NOT_FOUND", "message": "...", "hint": "...", "recoverable": true } }
+{
+  "v": 2,
+  "meta": { "requestId": "...", "timestamp": "...", "durationMs": 9 },
+  "result": {
+    "ok": false,
+    "command": "input.click",
+    "error": {
+      "code": "ELEMENT_NOT_FOUND",
+      "message": "...",
+      "hint": "...",
+      "recoverable": true,
+      "exitCode": 1,
+      "category": "state"
+    }
+  }
+}
 ```
-
-Lifecycle commands (`start`, `status`, `terminate`) print human-readable output.
 
 ## Notes
 

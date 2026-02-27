@@ -23,6 +23,74 @@ impl Default for Viewport {
 // --- Output contract ---
 // Every browser command emits exactly one of these as JSON to stdout.
 
+pub const RESPONSE_ENVELOPE_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseMeta {
+    pub request_id: String,
+    pub timestamp: String,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<ResponseSessionMeta>,
+}
+
+impl ResponseMeta {
+    pub fn new(
+        request_id: impl Into<String>,
+        timestamp: impl Into<String>,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            timestamp: timestamp.into(),
+            duration_ms,
+            session: None,
+        }
+    }
+
+    pub fn with_session(mut self, session: ResponseSessionMeta) -> Self {
+        self.session = Some(session);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseSessionMeta {
+    pub session_id: String,
+    pub instance_id: String,
+    pub client_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCategory {
+    Input,
+    State,
+    Timeout,
+    Navigation,
+    Infrastructure,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryStrategy {
+    AfterCommand,
+    AfterDelay,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryHint {
+    pub retryable: bool,
+    pub after_ms: u64,
+    pub strategy: RetryStrategy,
+    pub requires: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandResult<T>
 where
@@ -34,11 +102,16 @@ where
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ErrorEnvelope {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
     pub recoverable: bool,
+    pub exit_code: i32,
+    pub category: ErrorCategory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryHint>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,12 +123,51 @@ pub struct ErrorResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub enum ResultEnvelope<T>
+pub enum EnvelopeResult<T>
 where
     T: Serialize,
 {
     Ok(CommandResult<T>),
     Err(ErrorResult),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResultEnvelope<T>
+where
+    T: Serialize,
+{
+    pub v: u8,
+    pub meta: ResponseMeta,
+    pub result: EnvelopeResult<T>,
+}
+
+impl<T> ResultEnvelope<T>
+where
+    T: Serialize,
+{
+    pub fn success(command: impl Into<String>, data: T, meta: ResponseMeta) -> Self {
+        Self {
+            v: RESPONSE_ENVELOPE_VERSION,
+            meta,
+            result: EnvelopeResult::Ok(CommandResult {
+                ok: true,
+                command: command.into(),
+                data,
+            }),
+        }
+    }
+
+    pub fn error(command: impl Into<String>, error: ErrorEnvelope, meta: ResponseMeta) -> Self {
+        Self {
+            v: RESPONSE_ENVELOPE_VERSION,
+            meta,
+            result: EnvelopeResult::Err(ErrorResult {
+                ok: false,
+                command: command.into(),
+                error,
+            }),
+        }
+    }
 }
 
 // --- Snapshot types ---

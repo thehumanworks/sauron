@@ -1,8 +1,40 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Core code lives in `src/`. Entry point and CLI routing are in `src/main.rs`. Runtime/session lifecycle and backend storage (filesystem or Valkey) are in `src/runtime.rs`. Chrome process control is in `src/daemon.rs`, CDP transport in `src/cdp.rs`, and browser actions in `src/browser.rs`. Shared command/result types and errors are in `src/types.rs` and `src/errors.rs`.  
+Core code lives in `src/`. Entry point and CLI routing are in `src/main.rs`. Runtime/session lifecycle and backend storage are in `src/runtime.rs` (filesystem runtime store). Chrome process control is in `src/daemon.rs`, CDP transport in `src/cdp.rs`, and browser actions in `src/browser.rs`. Shared command/result types and errors are in `src/types.rs` and `src/errors.rs`.  
 User-facing docs are in `README.md`. Build config is in `Cargo.toml`.
+
+## Interaction & Data Flow Diagrams
+
+```mermaid
+flowchart TD
+  A["Agent or User"] --> CLI["sauron CLI"]
+  CLI --> LC["Lifecycle Command"]
+  CLI --> BC["Browser Command"]
+  LC --> RT["Runtime Store"]
+  LC --> DA["Daemon Controller"]
+  BC --> RS["Session Resolver"]
+  RS --> RT
+  BC --> PC["Browser and Page Client"]
+  PC --> CDP["CDP Transport"]
+  CDP --> CH["Chrome"]
+  BC --> OUT["JSON Output"]
+```
+
+```mermaid
+flowchart LR
+  MAIN["main.rs"] --> RUNTIME["runtime.rs"]
+  MAIN --> DAEMON["daemon.rs"]
+  MAIN --> BROWSER["browser.rs"]
+  BROWSER --> CDP["cdp.rs"]
+  RUNTIME --> FS["~/.sauron runtime store"]
+  BROWSER --> SNAP["snapshots and refs"]
+  BROWSER --> SESS["saved browser sessions"]
+  RUNTIME --> LOGS["command logs"]
+  SNAP --> FS
+  SESS --> FS
+  LOGS --> FS
+```
 
 ## Build, Test, and Development Commands
 - `cargo run -- --help`: run CLI locally and inspect command surface.
@@ -20,13 +52,13 @@ Naming:
 - `PascalCase` for structs/enums.
 - `SCREAMING_SNAKE_CASE` for error code serialization and constants.
 
-Prefer small, focused functions and explicit error mapping via `CliError`. Keep JSON output contract stable for browser commands.
+Prefer small, focused functions and explicit error mapping via `CliError`. Keep the v2 JSON output contract stable across all commands.
 
 ## Testing Guidelines
 Tests are currently module-local (for example in `src/context.rs`, `src/runtime.rs`). Add tests near modified logic.  
 For code touching environment variables in tests, reuse shared locking (`src/test_support.rs`) to avoid cross-test races.  
 At minimum, cover:
-- lifecycle transitions (`start`/`terminate`),
+- lifecycle transitions (`runtime start`/`runtime stop`),
 - session lookup/validation behavior,
 - failure-path regressions introduced by your change.
 
@@ -40,7 +72,7 @@ PRs should include:
 
 ## Security & Configuration Notes
 Do not commit runtime artifacts from `target/` or local session state under `~/.sauron/`.  
-Prefer environment variables for secrets/config (for example `SAURON_VALKEY_URL`) and avoid hardcoding credentials.
+Prefer environment variables for configuration (for example `SAURON_HOME`) and avoid hardcoding credentials.
 
 ## JJ Workspace Safety
 Before moving `main` to a workspace-derived change, verify ancestry and tree impact with `jj diff --from main --to <rev> --summary` to catch accidental whole-tree deletions from mis-rooted workspaces.

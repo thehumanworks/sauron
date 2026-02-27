@@ -70,14 +70,14 @@ impl BrowserClient {
         let ws_url = crate::daemon::get_ws_url(port).await.map_err(|_| {
             CliError::daemon_down(
                 format!("Could not connect to Chrome on port {}", port),
-                "Run 'sauron start' to start the Chrome daemon",
+                "Run 'sauron runtime start' to start the Chrome daemon",
             )
         })?;
 
         let cdp = CdpClient::connect(&ws_url).await.map_err(|e| {
             CliError::daemon_down(
                 format!("Could not connect to Chrome on port {}: {}", port, e),
-                "Run 'sauron start' to start the Chrome daemon",
+                "Run 'sauron runtime start' to start the Chrome daemon",
             )
         })?;
 
@@ -407,7 +407,7 @@ impl PageClient {
                 return Err(CliError::new(
                     crate::types::ErrorCode::NavTimeout,
                     format!("Navigation timed out after {:?}", timeout),
-                    "Try a different --wait-until or increase timeout",
+                    "Try a different --until value or increase --timeout-ms",
                     true,
                     1,
                 ));
@@ -723,8 +723,8 @@ impl PageClient {
             let Some(state) = state else {
                 return Err(CliError::new(
                     crate::types::ErrorCode::BadInput,
-                    "No refs available. Run 'sauron snapshot' first.",
-                    "Run 'sauron snapshot' to get fresh refs",
+                    "No refs available. Run 'sauron page snapshot' first.",
+                    "Run 'sauron page snapshot' to get fresh refs",
                     false,
                     4,
                 ));
@@ -743,7 +743,7 @@ impl PageClient {
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
-                    "Run 'sauron snapshot' to get fresh refs",
+                    "Run 'sauron page snapshot' to get fresh refs",
                     false,
                     4,
                 ));
@@ -763,7 +763,7 @@ impl PageClient {
                         "Ref @{} could not be resolved on the current page",
                         normalized
                     ),
-                    "Run 'sauron snapshot' to get fresh refs",
+                    "Run 'sauron page snapshot' to get fresh refs",
                     true,
                     1,
                 )
@@ -773,7 +773,7 @@ impl PageClient {
                 CliError::new(
                     crate::types::ErrorCode::ElementNotInteractive,
                     "Resolved ref has no backend DOM node id".to_string(),
-                    "Run 'sauron snapshot' and choose an interactive element",
+                    "Run 'sauron page snapshot' and choose an interactive element",
                     true,
                     1,
                 )
@@ -797,7 +797,7 @@ impl PageClient {
             return Err(CliError::new(
                 crate::types::ErrorCode::ElementNotFound,
                 format!("No element found matching text: {}", t),
-                "Run 'sauron snapshot' to inspect available elements",
+                "Run 'sauron page snapshot' to inspect available elements",
                 true,
                 1,
             ));
@@ -812,7 +812,7 @@ impl PageClient {
                     idx,
                     candidates.len()
                 ),
-                "Use --nth <n> with a valid match index",
+                "Use --match-index <n> with a valid match index",
                 true,
                 1,
             ));
@@ -823,12 +823,124 @@ impl PageClient {
             CliError::new(
                 crate::types::ErrorCode::ElementNotInteractive,
                 "Matched node has no backend DOM node id".to_string(),
-                "Run 'sauron snapshot' and choose an interactive element",
+                "Run 'sauron page snapshot' and choose an interactive element",
                 true,
                 1,
             )
         })?;
         Ok(backend)
+    }
+
+    #[allow(dead_code)]
+    pub async fn resolve_selector_backend_node_id(
+        &self,
+        selector: &str,
+        match_index: Option<u32>,
+    ) -> Result<u64, CliError> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(CliError::bad_input(
+                "Selector cannot be empty",
+                "Pass a non-empty CSS selector such as '#submit' or '.button.primary'",
+            ));
+        }
+
+        let doc = self
+            .call(
+                "DOM.getDocument",
+                json!({ "depth": 0, "pierce": true }),
+                CDP_TIMEOUT,
+            )
+            .await?;
+        let root_node_id = doc
+            .get("root")
+            .and_then(|v| v.get("nodeId"))
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                CliError::unknown(
+                    "DOM.getDocument returned no root node id",
+                    "Retry after navigation completes",
+                )
+            })?;
+
+        let query = self
+            .cdp
+            .call(
+                "DOM.querySelectorAll",
+                json!({
+                    "nodeId": root_node_id,
+                    "selector": selector,
+                }),
+                Some(self.session_id.as_str()),
+                CDP_TIMEOUT,
+            )
+            .await
+            .map_err(|err| map_selector_query_error(selector, err))?;
+
+        let node_ids = query
+            .get("nodeIds")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| CliError::unknown("DOM.querySelectorAll missing nodeIds", ""))?;
+
+        if node_ids.is_empty() {
+            return Err(CliError::new(
+                crate::types::ErrorCode::ElementNotFound,
+                format!("No element matched selector: {}", selector),
+                "Adjust the selector or run 'sauron page snapshot' to inspect available elements",
+                true,
+                1,
+            ));
+        }
+
+        let idx = match_index.unwrap_or(0) as usize;
+        if idx >= node_ids.len() {
+            return Err(CliError::new(
+                crate::types::ErrorCode::ElementAmbiguous,
+                format!(
+                    "Selector '{}' matched {} elements; index {} is out of range",
+                    selector,
+                    node_ids.len(),
+                    idx
+                ),
+                format!(
+                    "Use --match-index between 0 and {}",
+                    node_ids.len().saturating_sub(1)
+                ),
+                true,
+                1,
+            ));
+        }
+
+        let node_id = node_ids.get(idx).and_then(|v| v.as_i64()).ok_or_else(|| {
+            CliError::unknown("DOM.querySelectorAll returned invalid node id", "")
+        })?;
+
+        let described = self
+            .call(
+                "DOM.describeNode",
+                json!({ "nodeId": node_id }),
+                CDP_TIMEOUT,
+            )
+            .await?;
+
+        let backend_node_id = described
+            .get("node")
+            .and_then(|v| v.get("backendNodeId"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                CliError::new(
+                    crate::types::ErrorCode::ElementNotInteractive,
+                    format!(
+                        "Selector '{}' resolved to a node without backend DOM id",
+                        selector
+                    ),
+                    "Ensure the selector points to a live DOM element and retry",
+                    true,
+                    1,
+                )
+            })?;
+
+        Ok(backend_node_id)
     }
 
     pub async fn scroll_into_view(&self, backend_node_id: u64) -> Result<(), CliError> {
@@ -1069,7 +1181,7 @@ impl PageClient {
         Err(CliError::new(
             crate::types::ErrorCode::WaitTimeout,
             format!("Timed out waiting for text: {}", text),
-            "Run 'sauron snapshot' to inspect the current page state",
+            "Run 'sauron page snapshot' to inspect the current page state",
             true,
             1,
         ))
@@ -1098,31 +1210,96 @@ impl PageClient {
         Err(CliError::new(
             crate::types::ErrorCode::WaitTimeout,
             format!("Timed out waiting for url: {}", pattern),
-            "Run 'sauron snapshot' to inspect the current page state",
+            "Run 'sauron page snapshot' to inspect the current page state",
             true,
             1,
         ))
     }
 
+    #[allow(dead_code)]
     pub async fn wait_for_selector(
         &self,
         selector: &str,
         timeout: Duration,
     ) -> Result<(), CliError> {
+        let _ = self
+            .wait_for_selector_state(selector, SelectorWaitState::Attached, None, timeout)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn wait_for_selector_state(
+        &self,
+        selector: &str,
+        state: SelectorWaitState,
+        expected_count: Option<u32>,
+        timeout: Duration,
+    ) -> Result<SelectorWaitOutcome, CliError> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(CliError::bad_input(
+                "Selector cannot be empty",
+                "Pass a non-empty CSS selector such as '#submit' or '.button.primary'",
+            ));
+        }
+
         let deadline = Instant::now() + timeout;
-        let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
-        let expr = format!("document.querySelector({}) !== null", sel);
-        while Instant::now() < deadline {
-            let ok = self.eval_bool(&expr).await.unwrap_or(false);
-            if ok {
-                return Ok(());
+        let mut last = SelectorStats::default();
+        let mut last_error: Option<String> = None;
+
+        loop {
+            match self.selector_stats(selector).await {
+                Ok(stats) => {
+                    last = stats;
+                }
+                Err(err) => {
+                    if matches!(err.code, crate::types::ErrorCode::BadInput) {
+                        return Err(err);
+                    }
+
+                    last_error = Some(err.message.clone());
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(WAIT_POLL).await;
+                    continue;
+                }
+            }
+
+            let count_matches = expected_count
+                .map(|expected| last.count == expected)
+                .unwrap_or(true);
+            if count_matches && state.is_satisfied(last.count, last.visible_count) {
+                return Ok(SelectorWaitOutcome {
+                    selector: selector.to_string(),
+                    state,
+                    count: last.count,
+                    visible_count: last.visible_count,
+                    expected_count,
+                });
+            }
+
+            if Instant::now() >= deadline {
+                break;
             }
             tokio::time::sleep(WAIT_POLL).await;
         }
+
+        let expectation = expected_count
+            .map(|count| format!("state={} and count={}", state.as_str(), count))
+            .unwrap_or_else(|| format!("state={}", state.as_str()));
+        let error_context = last_error
+            .as_deref()
+            .map(|msg| format!("; last transient error={}", msg))
+            .unwrap_or_default();
+
         Err(CliError::new(
             crate::types::ErrorCode::WaitTimeout,
-            format!("Timed out waiting for selector: {}", selector),
-            "Run 'sauron snapshot' to inspect the current page state",
+            format!(
+                "Timed out waiting for selector '{}' ({}) [last count={}, visible={}{}]",
+                selector, expectation, last.count, last.visible_count, error_context
+            ),
+            "Check selector/state, or increase --timeout-ms",
             true,
             1,
         ))
@@ -1138,7 +1315,7 @@ impl PageClient {
             Err(CliError::new(
                 crate::types::ErrorCode::WaitTimeout,
                 "Timed out waiting for network idle".to_string(),
-                "Run 'sauron snapshot' to inspect the current page state",
+                "Run 'sauron page snapshot' to inspect the current page state",
                 true,
                 1,
             ))
@@ -1148,6 +1325,172 @@ impl PageClient {
     async fn eval_bool(&self, expression: &str) -> Result<bool, CliError> {
         let v = self.eval(expression).await?;
         Ok(v.as_bool().unwrap_or(false))
+    }
+
+    async fn selector_stats(&self, selector: &str) -> Result<SelectorStats, CliError> {
+        let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+        let expr = format!(
+            r#"(() => {{
+  const selector = {selector};
+  const result = {{ count: 0, visibleCount: 0, error: null }};
+  const isVisible = (el) => {{
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (!style) return false;
+    if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }};
+  try {{
+    const nodes = Array.from(document.querySelectorAll(selector));
+    result.count = nodes.length;
+    for (const node of nodes) {{
+      if (isVisible(node)) result.visibleCount += 1;
+    }}
+  }} catch (err) {{
+    result.error = String((err && err.message) || err || "Invalid selector");
+  }}
+  return result;
+}})()"#,
+            selector = sel
+        );
+
+        let value = self.eval(&expr).await?;
+        let obj = value.as_object().ok_or_else(|| {
+            CliError::unknown(
+                "Failed to evaluate selector state in page context",
+                "Retry after navigation completes",
+            )
+        })?;
+
+        if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
+            if !err.trim().is_empty() {
+                return Err(CliError::bad_input(
+                    format!("Invalid CSS selector '{}': {}", selector, err),
+                    "Check selector syntax (for example: '#login', '.btn.primary', 'form input[name=\"email\"]')",
+                ));
+            }
+        }
+
+        let count = value_to_u32(obj.get("count")).unwrap_or(0);
+        let visible_count = value_to_u32(obj.get("visibleCount")).unwrap_or(0);
+
+        Ok(SelectorStats {
+            count,
+            visible_count,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub async fn capture_console_for(
+        &self,
+        duration: Duration,
+    ) -> Result<Vec<ConsoleCaptureEntry>, CliError> {
+        let mut events = self.cdp.subscribe();
+        let _ = self.call("Runtime.enable", json!({}), CDP_TIMEOUT).await;
+        let _ = self.call("Log.enable", json!({}), CDP_TIMEOUT).await;
+
+        let deadline = Instant::now() + duration;
+        let mut out = Vec::new();
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let tick = Duration::from_millis(250).min(remaining);
+
+            match tokio::time::timeout(tick, events.recv()).await {
+                Ok(Ok(ev)) => {
+                    if ev.session_id.as_deref() != Some(self.session_id.as_str()) {
+                        continue;
+                    }
+
+                    let entry = match ev.method.as_str() {
+                        "Runtime.consoleAPICalled" => {
+                            console_entry_from_runtime_console(&ev.params)
+                        }
+                        "Runtime.exceptionThrown" => {
+                            console_entry_from_runtime_exception(&ev.params)
+                        }
+                        "Log.entryAdded" => console_entry_from_log_entry(&ev.params),
+                        _ => None,
+                    };
+
+                    if let Some(entry) = entry {
+                        out.push(entry);
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    return Err(CliError::daemon_down(
+                        "CDP event stream closed during console capture",
+                        "Run 'sauron runtime start' and retry console capture",
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+
+        Ok(out)
+    }
+
+    #[allow(dead_code)]
+    pub async fn capture_network_for(
+        &self,
+        duration: Duration,
+    ) -> Result<Vec<NetworkCaptureEntry>, CliError> {
+        let mut events = self.cdp.subscribe();
+        let _ = self.call("Network.enable", json!({}), CDP_TIMEOUT).await;
+
+        let deadline = Instant::now() + duration;
+        let mut out = Vec::new();
+        let mut by_request: HashMap<String, NetworkRequestContext> = HashMap::new();
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let tick = Duration::from_millis(250).min(remaining);
+
+            match tokio::time::timeout(tick, events.recv()).await {
+                Ok(Ok(ev)) => {
+                    if ev.session_id.as_deref() != Some(self.session_id.as_str()) {
+                        continue;
+                    }
+
+                    match ev.method.as_str() {
+                        "Network.requestWillBeSent" => {
+                            if let Some(entry) =
+                                network_request_entry_from_event(&ev.params, &mut by_request)
+                            {
+                                out.push(entry);
+                            }
+                        }
+                        "Network.responseReceived" => {
+                            if let Some(entry) =
+                                network_response_entry_from_event(&ev.params, &by_request)
+                            {
+                                out.push(entry);
+                            }
+                        }
+                        "Network.loadingFailed" => {
+                            if let Some(entry) =
+                                network_failure_entry_from_event(&ev.params, &by_request)
+                            {
+                                out.push(entry);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    return Err(CliError::daemon_down(
+                        "CDP event stream closed during network capture",
+                        "Run 'sauron runtime start' and retry network capture",
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+
+        Ok(out)
     }
 
     pub async fn next_dialog(&self, timeout: Duration) -> Result<Option<DialogEvent>, CliError> {
@@ -1307,6 +1650,116 @@ pub struct DialogEvent {
     #[serde(rename = "type")]
     pub dialog_type: String,
     pub default_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SelectorWaitState {
+    Attached,
+    Visible,
+    Hidden,
+    Detached,
+}
+
+impl SelectorWaitState {
+    #[allow(dead_code)]
+    pub fn parse(value: &str) -> Result<Self, CliError> {
+        match value.to_ascii_lowercase().as_str() {
+            "attached" => Ok(Self::Attached),
+            "visible" => Ok(Self::Visible),
+            "hidden" => Ok(Self::Hidden),
+            "detached" => Ok(Self::Detached),
+            _ => Err(CliError::bad_input(
+                format!("Unsupported selector wait state: {}", value),
+                "Use one of: attached, visible, hidden, detached",
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+            Self::Detached => "detached",
+        }
+    }
+
+    fn is_satisfied(self, count: u32, visible_count: u32) -> bool {
+        match self {
+            Self::Attached => count > 0,
+            Self::Visible => visible_count > 0,
+            Self::Hidden => visible_count == 0,
+            Self::Detached => count == 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectorWaitOutcome {
+    pub selector: String,
+    pub state: SelectorWaitState,
+    pub count: u32,
+    pub visible_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct ConsoleCaptureEntry {
+    pub kind: String,
+    pub level: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct NetworkCaptureEntry {
+    pub kind: String,
+    pub request_id: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canceled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_cache: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SelectorStats {
+    count: u32,
+    visible_count: u32,
 }
 
 // --- AX parsing helpers ---
@@ -1754,17 +2207,367 @@ fn map_cdp_error(_method: &str) -> impl FnOnce(CdpError) -> CliError {
     move |e| match e {
         CdpError::Timeout => CliError::timeout(
             "CDP call timed out",
-            "Run 'sauron snapshot' to inspect the current page state",
+            "Run 'sauron page snapshot' to inspect the current page state",
         ),
         CdpError::WebSocket(msg) => CliError::daemon_down(
             format!("Chrome websocket error: {}", msg),
-            "Run 'sauron start' to start the Chrome daemon",
+            "Run 'sauron runtime start' to start the Chrome daemon",
         ),
         CdpError::Protocol(msg) => CliError::unknown(
             format!("CDP protocol error: {}", msg),
-            "Run 'sauron snapshot' to inspect the current page state",
+            "Run 'sauron page snapshot' to inspect the current page state",
         ),
     }
+}
+
+#[allow(dead_code)]
+fn map_selector_query_error(selector: &str, err: CdpError) -> CliError {
+    match err {
+        CdpError::Protocol(msg) if is_invalid_selector_protocol_message(&msg) => CliError::bad_input(
+            format!("Invalid CSS selector: {}", selector),
+            "Check selector syntax (for example: '#login', '.btn.primary', 'form input[name=\"email\"]')",
+        ),
+        other => map_cdp_error("DOM.querySelectorAll")(other),
+    }
+}
+
+#[allow(dead_code)]
+fn is_invalid_selector_protocol_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("syntaxerror")
+        || lower.contains("invalid selector")
+        || lower.contains("not a valid selector")
+        || lower.contains("queryselector")
+}
+
+fn value_to_u32(value: Option<&Value>) -> Option<u32> {
+    let value = value?;
+    if let Some(v) = value.as_u64() {
+        return u32::try_from(v).ok();
+    }
+    if let Some(v) = value.as_i64() {
+        if v >= 0 {
+            return u32::try_from(v as u64).ok();
+        }
+    }
+    if let Some(v) = value.as_f64() {
+        if v.is_finite() && v >= 0.0 {
+            return u32::try_from(v.round() as u64).ok();
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn value_to_i64(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(v) = value.as_i64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_u64() {
+        return i64::try_from(v).ok();
+    }
+    if let Some(v) = value.as_f64() {
+        if v.is_finite() {
+            return Some(v.round() as i64);
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn value_to_f64(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    if let Some(v) = value.as_f64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v as f64);
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v as f64);
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn runtime_arg_text(arg: &Value) -> String {
+    if let Some(value) = arg.get("value") {
+        if let Some(s) = value.as_str() {
+            return s.to_string();
+        }
+        if value.is_number() || value.is_boolean() {
+            return value.to_string();
+        }
+        if !value.is_null() {
+            return value.to_string();
+        }
+    }
+
+    if let Some(v) = arg.get("unserializableValue").and_then(|v| v.as_str()) {
+        return v.to_string();
+    }
+    if let Some(v) = arg.get("description").and_then(|v| v.as_str()) {
+        return v.to_string();
+    }
+    if let Some(v) = arg.get("type").and_then(|v| v.as_str()) {
+        return format!("[{}]", v);
+    }
+    String::new()
+}
+
+#[allow(dead_code)]
+fn console_entry_from_runtime_console(params: &Value) -> Option<ConsoleCaptureEntry> {
+    let level = params
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("log")
+        .to_string();
+
+    let text = params
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|args| {
+            args.iter()
+                .map(runtime_arg_text)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "[console]".to_string());
+
+    let (url, line, column) = params
+        .get("stackTrace")
+        .and_then(|v| v.get("callFrames"))
+        .and_then(|v| v.as_array())
+        .and_then(|frames| frames.first())
+        .map(|frame| {
+            (
+                frame
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                value_to_i64(frame.get("lineNumber")),
+                value_to_i64(frame.get("columnNumber")),
+            )
+        })
+        .unwrap_or((None, None, None));
+
+    Some(ConsoleCaptureEntry {
+        kind: "runtime.console".to_string(),
+        level,
+        text,
+        source: params
+            .get("context")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        url,
+        line,
+        column,
+        timestamp: value_to_f64(params.get("timestamp")),
+    })
+}
+
+#[allow(dead_code)]
+fn console_entry_from_runtime_exception(params: &Value) -> Option<ConsoleCaptureEntry> {
+    let details = params.get("exceptionDetails")?;
+    let text = details
+        .get("exception")
+        .and_then(|v| v.get("description"))
+        .and_then(|v| v.as_str())
+        .or_else(|| details.get("text").and_then(|v| v.as_str()))
+        .unwrap_or("Uncaught exception")
+        .to_string();
+
+    Some(ConsoleCaptureEntry {
+        kind: "runtime.exception".to_string(),
+        level: "error".to_string(),
+        text,
+        source: Some("runtime".to_string()),
+        url: details
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        line: value_to_i64(details.get("lineNumber")),
+        column: value_to_i64(details.get("columnNumber")),
+        timestamp: value_to_f64(params.get("timestamp")),
+    })
+}
+
+#[allow(dead_code)]
+fn console_entry_from_log_entry(params: &Value) -> Option<ConsoleCaptureEntry> {
+    let entry = params.get("entry")?;
+    Some(ConsoleCaptureEntry {
+        kind: "log.entry".to_string(),
+        level: entry
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info")
+            .to_string(),
+        text: entry
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        source: entry
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        url: entry
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        line: value_to_i64(entry.get("lineNumber")),
+        column: None,
+        timestamp: value_to_f64(entry.get("timestamp")),
+    })
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct NetworkRequestContext {
+    url: String,
+    method: Option<String>,
+    resource_type: Option<String>,
+}
+
+#[allow(dead_code)]
+fn network_request_entry_from_event(
+    params: &Value,
+    by_request: &mut HashMap<String, NetworkRequestContext>,
+) -> Option<NetworkCaptureEntry> {
+    let request_id = params.get("requestId")?.as_str()?.to_string();
+    let request = params.get("request").unwrap_or(&Value::Null);
+    let url = request
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let method = request
+        .get("method")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let resource_type = params
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+
+    by_request.insert(
+        request_id.clone(),
+        NetworkRequestContext {
+            url: url.clone(),
+            method: method.clone(),
+            resource_type: resource_type.clone(),
+        },
+    );
+
+    Some(NetworkCaptureEntry {
+        kind: "request".to_string(),
+        request_id,
+        url,
+        method,
+        resource_type,
+        status: None,
+        status_text: None,
+        ok: None,
+        mime_type: None,
+        error_text: None,
+        canceled: None,
+        blocked_reason: None,
+        from_cache: None,
+        timestamp: value_to_f64(params.get("timestamp")),
+    })
+}
+
+#[allow(dead_code)]
+fn network_response_entry_from_event(
+    params: &Value,
+    by_request: &HashMap<String, NetworkRequestContext>,
+) -> Option<NetworkCaptureEntry> {
+    let request_id = params.get("requestId")?.as_str()?.to_string();
+    let response = params.get("response").unwrap_or(&Value::Null);
+    let existing = by_request.get(&request_id);
+
+    let url = response
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .or_else(|| existing.map(|ctx| ctx.url.clone()))
+        .unwrap_or_default();
+
+    let status = value_to_i64(response.get("status"));
+    let from_disk_cache = response.get("fromDiskCache").and_then(|v| v.as_bool());
+    let from_service_worker = response.get("fromServiceWorker").and_then(|v| v.as_bool());
+    let from_cache = match (from_disk_cache, from_service_worker) {
+        (Some(disk), Some(sw)) => Some(disk || sw),
+        (Some(disk), None) => Some(disk),
+        (None, Some(sw)) => Some(sw),
+        (None, None) => None,
+    };
+
+    Some(NetworkCaptureEntry {
+        kind: "response".to_string(),
+        request_id,
+        url,
+        method: existing.and_then(|ctx| ctx.method.clone()),
+        resource_type: params
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+            .or_else(|| existing.and_then(|ctx| ctx.resource_type.clone())),
+        status,
+        status_text: response
+            .get("statusText")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        ok: status.map(|s| (200..400).contains(&s)),
+        mime_type: response
+            .get("mimeType")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        error_text: None,
+        canceled: None,
+        blocked_reason: None,
+        from_cache,
+        timestamp: value_to_f64(params.get("timestamp")),
+    })
+}
+
+#[allow(dead_code)]
+fn network_failure_entry_from_event(
+    params: &Value,
+    by_request: &HashMap<String, NetworkRequestContext>,
+) -> Option<NetworkCaptureEntry> {
+    let request_id = params.get("requestId")?.as_str()?.to_string();
+    let existing = by_request.get(&request_id);
+
+    Some(NetworkCaptureEntry {
+        kind: "failure".to_string(),
+        request_id,
+        url: existing.map(|ctx| ctx.url.clone()).unwrap_or_default(),
+        method: existing.and_then(|ctx| ctx.method.clone()),
+        resource_type: params
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+            .or_else(|| existing.and_then(|ctx| ctx.resource_type.clone())),
+        status: None,
+        status_text: None,
+        ok: Some(false),
+        mime_type: None,
+        error_text: params
+            .get("errorText")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        canceled: params.get("canceled").and_then(|v| v.as_bool()),
+        blocked_reason: params
+            .get("blockedReason")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
+        from_cache: None,
+        timestamp: value_to_f64(params.get("timestamp")),
+    })
 }
 
 // --- Key helpers ---

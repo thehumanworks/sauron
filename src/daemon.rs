@@ -309,6 +309,7 @@ pub struct StartResult {
     pub pid: u32,
     pub port: u16,
     pub ws_url: String,
+    pub reused_existing: bool,
     #[allow(dead_code)]
     pub xvfb_pid: Option<u32>,
     #[allow(dead_code)]
@@ -363,13 +364,14 @@ pub async fn start(
                         "Chrome daemon for this instance is already running on port {} (requested {}).",
                         status_port, port
                     ),
-                    "Run 'sauron terminate' first, then retry with your desired --port",
+                    "Run 'sauron runtime stop' first, then retry with your desired --port",
                 ));
             }
             return Ok(StartResult {
                 pid,
                 port: status_port,
                 ws_url,
+                reused_existing: true,
                 xvfb_pid: None,
                 display: None,
             });
@@ -382,7 +384,7 @@ pub async fn start(
                     "Port {} is already in use by an unmanaged Chrome process. Stop it manually or use a different port/instance.",
                     port
                 ),
-                "Try: sauron start --port <free-port> or sauron start --instance <name>",
+                "Try: sauron runtime start --port <free-port> or sauron runtime start --instance <name>",
             ));
         }
         DaemonStatus::Stale { .. } => {
@@ -396,7 +398,7 @@ pub async fn start(
                         "Port {} is already in use by an unmanaged process. Stop it manually or use a different port/instance.",
                         port
                     ),
-                    "Try: sauron start --port <free-port> or sauron start --instance <name>",
+                    "Try: sauron runtime start --port <free-port> or sauron runtime start --instance <name>",
                 ));
             }
         }
@@ -465,6 +467,7 @@ pub async fn start(
                     pid,
                     port,
                     ws_url,
+                    reused_existing: false,
                     xvfb_pid,
                     display,
                 });
@@ -527,6 +530,10 @@ pub async fn stop(
             port,
             ..
         } if live_pid == data.pid && port == data.port => {}
+        DaemonStatus::Stale {
+            pid: Some(stale_pid),
+            ..
+        } if stale_pid == data.pid && is_process_alive(data.pid) => {}
         _ => {
             // Stale pid file
             if let Some(xpid) = xvfb_pid {

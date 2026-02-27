@@ -270,7 +270,7 @@ impl RuntimeStore {
         if require_existing && !path.exists() {
             return Err(CliError::session_invalid(
                 format!("Session '{}' was not found", session.session_id),
-                "Run 'sauron start' to create a fresh session",
+                "Run 'sauron runtime start' to create a fresh session",
             ));
         }
         atomic_write(&path, text.as_bytes())
@@ -290,13 +290,13 @@ impl RuntimeStore {
         let mut session = self.load_session_fs(session_id)?.ok_or_else(|| {
             CliError::session_invalid(
                 format!("Session '{}' was not found", session_id),
-                "Run 'sauron start' to create a fresh session",
+                "Run 'sauron runtime start' to create a fresh session",
             )
         })?;
         if session.state != RuntimeSessionState::Active {
             return Err(CliError::session_terminated(
                 format!("Session '{}' is terminated", session_id),
-                "Run 'sauron start' to create a new active session",
+                "Run 'sauron runtime start' to create a new active session",
             ));
         }
         session.mark_command(command);
@@ -461,7 +461,7 @@ impl RuntimeStore {
         if !session_path.exists() {
             return Err(CliError::session_invalid(
                 format!("Session '{}' was not found", session_id),
-                "Run 'sauron start' to create a fresh session",
+                "Run 'sauron runtime start' to create a fresh session",
             ));
         }
 
@@ -807,7 +807,7 @@ pub fn resolve_active_session(
 
     Err(CliError::session_required(
         "No active runtime session found for this project".to_string(),
-        "Run 'sauron start' in this project, then rerun the command",
+        "Run 'sauron runtime start' in this project, then rerun the command",
     ))
 }
 
@@ -831,14 +831,14 @@ fn load_active_session_strict(
     let Some(session) = store.load_session(session_id)? else {
         return Err(CliError::session_invalid(
             format!("Session '{}' was not found", session_id),
-            "Run 'sauron start' to create a fresh session",
+            "Run 'sauron runtime start' to create a fresh session",
         ));
     };
 
     if session.state != RuntimeSessionState::Active {
         return Err(CliError::session_terminated(
             format!("Session '{}' is terminated", session_id),
-            "Run 'sauron start' to create a new active session",
+            "Run 'sauron runtime start' to create a new active session",
         ));
     }
 
@@ -956,7 +956,7 @@ pub fn session_required_error(command_name: &str) -> CliError {
             "Command '{}' requires an active runtime session, but none was found",
             command_name
         ),
-        "Run 'sauron start' in this project, then rerun the command",
+        "Run 'sauron runtime start' in this project, then rerun the command",
         false,
         6,
     )

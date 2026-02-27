@@ -13,19 +13,23 @@ mod types;
 
 use base64::Engine as _;
 use browser::BrowserClient;
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use context::AppContext;
-use errors::{make_error, make_success, print_result, CliError};
+use errors::{
+    make_error, make_error_with_meta, make_success, make_success_with_meta, print_result, CliError,
+};
+use regex::Regex;
 use runtime::{
     activate_session, cleanup_session_state, cleanup_stale_state, create_session_record,
     resolve_active_session, resolve_project_root_path, session_required_error, terminate_session,
     CleanupStats, RuntimeSessionRecord, RuntimeStore,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::process::Command as ProcessCommand;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,42 +39,42 @@ use std::time::Duration;
 )]
 struct Cli {
     /// Runtime session id override (otherwise resolved by process binding, project context, then SAURON_SESSION_ID)
-    #[arg(long)]
+    #[arg(long, global = true)]
     session_id: Option<String>,
 
     /// Optional instance id override for `start` (auto-generated when omitted)
-    #[arg(long)]
+    #[arg(long, global = true)]
     instance: Option<String>,
 
     /// Optional client id override for `start` (auto-generated when omitted)
-    #[arg(long)]
+    #[arg(long, global = true)]
     client: Option<String>,
 
     /// Chrome DevTools debugging port (overrides pidfile)
-    #[arg(long)]
+    #[arg(long, global = true)]
     port: Option<u16>,
 
     /// Optional override for pidfile location
-    #[arg(long)]
+    #[arg(long, global = true)]
     pid_path: Option<PathBuf>,
 
     /// Optional override for Chrome user data dir
-    #[arg(long)]
+    #[arg(long, global = true)]
     user_data_dir: Option<PathBuf>,
 
     /// Optional timeout in milliseconds (command-specific defaults apply when omitted)
-    #[arg(long)]
-    timeout: Option<u64>,
+    #[arg(long, global = true)]
+    timeout_ms: Option<u64>,
 
     /// Sleep for N milliseconds before executing the subcommand.
     ///
     /// This is useful for agent loops that need deterministic pacing.
     #[arg(long, global = true)]
-    wait: Option<u64>,
+    delay_ms: Option<u64>,
 
     /// Viewport in WIDTHxHEIGHT format (e.g. 1440x900).
     ///
-    /// - `sauron start`: sets the session default viewport.
+    /// - `sauron runtime start`: sets the session default viewport.
     /// - Browser commands: overrides the viewport for this invocation.
     #[arg(long, global = true)]
     viewport: Option<String>,
@@ -81,176 +85,22 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start a new runtime session and Chrome daemon
-    Start {
-        /// (macOS only) Enable WebGL-friendly rendering flags (software rendering via SwiftShader).
-        ///
-        /// Useful when you need WebGL/canvas-heavy pages to work in headless environments.
-        /// Note: SwiftShader is less secure; use only with trusted content.
-        #[cfg(target_os = "macos")]
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-        webgl: Option<bool>,
-
-        /// Enable GPU acceleration.
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-        enable_gpu: Option<bool>,
+    /// Runtime lifecycle commands
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommands,
     },
 
-    /// Terminate the active runtime session and clean up state
-    #[command(alias = "stop")]
-    Terminate {
-        /// After stopping, remove all stale instances, dead sessions, and orphaned state.
-        #[arg(long)]
-        cleanup: bool,
+    /// Page-level browser commands
+    Page {
+        #[command(subcommand)]
+        command: PageCommands,
     },
 
-    /// Show Chrome daemon status
-    Status,
-
-    /// Navigate to a URL
-    Navigate {
-        url: String,
-        #[arg(long, default_value = "load")]
-        wait_until: String,
-    },
-
-    /// Snapshot the current page accessibility tree (agent-friendly)
-    Snapshot {
-        #[arg(long)]
-        interactive: bool,
-        #[arg(long)]
-        clickable: bool,
-        #[arg(long)]
-        scope: Option<String>,
-        #[arg(long)]
-        iframes: bool,
-    },
-
-    /// Take a screenshot
-    Screenshot {
-        #[arg(long)]
-        full_page: bool,
-        /// Capture mobile/tablet/desktop screenshots in one command.
-        #[arg(long)]
-        responsive: bool,
-        /// Image quality profile.
-        #[arg(long, value_enum, default_value = "high")]
-        quality: ScreenshotQualityArg,
-        #[arg(long)]
-        path: Option<PathBuf>,
-    },
-    /// Extract the full text content of the current page as Markdown
-    #[command(alias = "markdown")]
-    Content,
-
-    /// Collect multiple artifacts in one command (runs actions in parallel)
-    ///
-    /// Example:
-    ///   sauron collect --snapshot --screenshot --content
-    Collect {
-        /// Include an accessibility snapshot (same as `snapshot`)
-        #[arg(long)]
-        snapshot: bool,
-
-        /// Include a screenshot (same as `screenshot`)
-        #[arg(long)]
-        screenshot: bool,
-
-        /// Include Markdown content (same as `content`)
-        #[arg(long)]
-        content: bool,
-
-        // --- Snapshot options (only used if --snapshot is set) ---
-        #[arg(long)]
-        interactive: bool,
-        #[arg(long)]
-        clickable: bool,
-        #[arg(long)]
-        scope: Option<String>,
-        #[arg(long)]
-        iframes: bool,
-
-        // --- Screenshot options (only used if --screenshot is set) ---
-        #[arg(long)]
-        full_page: bool,
-        /// Image quality profile for the screenshot action.
-        #[arg(long, value_enum, default_value = "high")]
-        screenshot_quality: ScreenshotQualityArg,
-        /// Optional file path to write the screenshot image.
-        /// If omitted, screenshot data is returned as base64 in JSON.
-        #[arg(long)]
-        screenshot_path: Option<PathBuf>,
-    },
-
-    /// Click an element by ref (@e1) or text
-    Click {
-        target: String,
-        #[arg(long)]
-        double: bool,
-        /// When targeting by text, click the nth match
-        #[arg(long)]
-        nth: Option<u32>,
-    },
-
-    /// Fill an input/select by ref (@e1) or text
-    Fill {
-        target: String,
-        text: String,
-        /// When targeting by text, fill the nth match
-        #[arg(long)]
-        nth: Option<u32>,
-    },
-
-    /// Press a key or key combination (e.g. Enter, Control+A)
-    Key { combo: String },
-
-    /// Hover an element by ref (@e1) or text
-    Hover {
-        target: String,
-        #[arg(long)]
-        nth: Option<u32>,
-    },
-
-    /// Scroll
-    Scroll {
-        /// Direction (up/down/top/bottom) or element ref/text
-        target: String,
-        /// Amount in pixels for directional scroll
-        #[arg(long, default_value_t = 500)]
-        amount: i64,
-        #[arg(long)]
-        nth: Option<u32>,
-    },
-
-    /// Wait for a condition
-    Wait {
-        /// Milliseconds to sleep
-        duration: Option<u64>,
-        #[arg(long)]
-        text: Option<String>,
-        #[arg(long)]
-        url: Option<String>,
-        #[arg(long)]
-        selector: Option<String>,
-        #[arg(long)]
-        idle: bool,
-    },
-
-    /// Handle the next JavaScript dialog (accept/dismiss)
-    Dialog {
-        action: String,
-        #[arg(long)]
-        text: Option<String>,
-    },
-
-    /// Run JavaScript in the page context
-    #[command(alias = "js")]
-    Eval { expression: String },
-
-    /// Diff the last two snapshots
-    Diff {
-        #[arg(long, default_value = "unified")]
-        format: String,
+    /// Input interaction commands
+    Input {
+        #[command(subcommand)]
+        command: InputCommands,
     },
 
     /// Tab management
@@ -259,10 +109,42 @@ enum Commands {
         command: TabCommands,
     },
 
-    /// Save/load/list/delete browser sessions
-    Session {
+    /// Save/load/list/delete browser state
+    State {
         #[command(subcommand)]
-        command: SessionCommands,
+        command: StateCommands,
+    },
+
+    /// Snapshot ref inspection
+    Ref {
+        #[command(subcommand)]
+        command: RefCommands,
+    },
+
+    /// Runtime log inspection
+    Logs {
+        #[command(subcommand)]
+        command: LogCommands,
+    },
+
+    /// Console capture controls
+    Console {
+        #[command(subcommand)]
+        command: ConsoleCommands,
+    },
+
+    /// Network capture controls
+    Network {
+        #[command(subcommand)]
+        command: NetworkCommands,
+    },
+
+    /// Execute a workflow file
+    Run {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        stop_on_error: bool,
     },
 
     /// Print shell completion scripts to stdout (bash/zsh).
@@ -277,6 +159,192 @@ enum Commands {
 }
 
 #[derive(Subcommand, Debug)]
+enum RuntimeCommands {
+    /// Start a new runtime session and Chrome daemon
+    Start {
+        /// Enable WebGL-friendly rendering flags.
+        #[arg(long, conflicts_with = "no_webgl")]
+        webgl: bool,
+
+        /// Disable WebGL-friendly rendering flags.
+        #[arg(long, conflicts_with = "webgl")]
+        no_webgl: bool,
+
+        /// Enable GPU acceleration.
+        #[arg(long, conflicts_with = "no_gpu")]
+        gpu: bool,
+
+        /// Disable GPU acceleration.
+        #[arg(long, conflicts_with = "gpu")]
+        no_gpu: bool,
+    },
+
+    /// Stop the active runtime session
+    Stop,
+
+    /// Show runtime daemon status
+    Status,
+
+    /// Remove stale runtime artifacts
+    Cleanup,
+}
+
+#[derive(Subcommand, Debug)]
+enum PageCommands {
+    /// Navigate to a URL
+    Goto {
+        url: String,
+        #[arg(long, default_value = "load")]
+        until: String,
+    },
+
+    /// Snapshot the current page accessibility tree (agent-friendly)
+    Snapshot {
+        #[arg(long)]
+        interactive: bool,
+        #[arg(long)]
+        clickable: bool,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        include_iframes: bool,
+        #[arg(long, value_enum, default_value = "text")]
+        format: SnapshotFormatArg,
+    },
+
+    /// Take a screenshot
+    Screenshot {
+        #[arg(long)]
+        full: bool,
+        /// Capture mobile/tablet/desktop screenshots in one command.
+        #[arg(long)]
+        responsive: bool,
+        /// Image quality profile.
+        #[arg(long, value_enum, default_value = "high")]
+        quality: ScreenshotQualityArg,
+        #[arg(long, conflicts_with = "output_dir")]
+        output: Option<PathBuf>,
+        #[arg(long, conflicts_with = "output")]
+        output_dir: Option<PathBuf>,
+    },
+
+    /// Collect multiple artifacts in one command (runs actions in parallel)
+    Collect {
+        /// Include an accessibility snapshot (same as `snapshot`)
+        #[arg(long)]
+        snapshot: bool,
+
+        /// Include a screenshot (same as `screenshot`)
+        #[arg(long)]
+        screenshot: bool,
+
+        /// Include Markdown content (same as `markdown`)
+        #[arg(long)]
+        content: bool,
+
+        // --- Snapshot options (only used if --snapshot is set) ---
+        #[arg(long)]
+        interactive: bool,
+        #[arg(long)]
+        clickable: bool,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        include_iframes: bool,
+
+        // --- Screenshot options (only used if --screenshot is set) ---
+        #[arg(long)]
+        full: bool,
+        /// Image quality profile for the screenshot action.
+        #[arg(long, value_enum, default_value = "high")]
+        quality: ScreenshotQualityArg,
+        /// Optional file path to write the screenshot image.
+        /// If omitted, screenshot data is returned as base64 in JSON.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Extract the full text content of the current page as Markdown
+    Markdown,
+
+    /// Wait for a condition
+    Wait {
+        #[arg(long)]
+        for_ms: Option<u64>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        selector: Option<String>,
+        #[arg(long)]
+        state: Option<SelectorStateArg>,
+        #[arg(long)]
+        count: Option<u32>,
+        #[arg(long)]
+        idle: bool,
+    },
+
+    /// Run JavaScript in the page context
+    Js { expression: String },
+
+    /// Diff the last two snapshots
+    Diff {
+        #[arg(long)]
+        from: Option<u64>,
+        #[arg(long)]
+        to: Option<u64>,
+        #[arg(long, default_value = "unified")]
+        format: String,
+    },
+
+    /// Handle the next JavaScript dialog (accept/dismiss)
+    Dialog {
+        action: String,
+        #[arg(long)]
+        text: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InputCommands {
+    /// Click an element by ref (@e1) or text
+    Click {
+        #[command(flatten)]
+        target: TargetArgs,
+        #[arg(long)]
+        double: bool,
+    },
+
+    /// Fill an input/select by ref (@e1) or text
+    Fill {
+        #[command(flatten)]
+        target: TargetArgs,
+        value: String,
+    },
+
+    /// Hover an element by ref (@e1) or text
+    Hover {
+        #[command(flatten)]
+        target: TargetArgs,
+    },
+
+    /// Scroll
+    Scroll {
+        #[arg(long)]
+        direction: Option<ScrollDirectionArg>,
+        /// Amount in pixels for directional scroll
+        #[arg(long, default_value_t = 500)]
+        amount: i64,
+        #[command(flatten)]
+        target: TargetArgs,
+    },
+
+    /// Press a key or key combination (e.g. Enter, Control+A)
+    Press { combo: String },
+}
+
+#[derive(Subcommand, Debug)]
 enum TabCommands {
     List,
     Open { url: String },
@@ -285,11 +353,126 @@ enum TabCommands {
 }
 
 #[derive(Subcommand, Debug)]
-enum SessionCommands {
+enum StateCommands {
     Save { name: String },
     Load { name: String },
     List,
     Delete { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum RefCommands {
+    List,
+    Show {
+        reference: String,
+    },
+    Validate {
+        #[arg(long, short = 'r')]
+        reference: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LogCommands {
+    List,
+    Tail {
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConsoleCommands {
+    Capture {
+        #[arg(long, default_value_t = 5_000)]
+        duration_ms: u64,
+        #[arg(long)]
+        level: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum NetworkCommands {
+    Capture {
+        #[arg(long, default_value_t = 5_000)]
+        duration_ms: u64,
+        #[arg(long)]
+        url_glob: Option<String>,
+    },
+}
+
+#[derive(Args, Debug, Clone, Default)]
+struct TargetArgs {
+    #[arg(long)]
+    selector: Option<String>,
+    #[arg(long = "ref")]
+    reference: Option<String>,
+    #[arg(long)]
+    text: Option<String>,
+    #[arg(long)]
+    match_index: Option<u32>,
+}
+
+impl TargetArgs {
+    fn is_empty(&self) -> bool {
+        self.selector
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+            && self
+                .reference
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && self.text.as_deref().map(str::trim).unwrap_or("").is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SnapshotFormatArg {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SelectorStateArg {
+    Attached,
+    Visible,
+    Hidden,
+    Detached,
+}
+
+impl SelectorStateArg {
+    fn to_browser(self) -> browser::SelectorWaitState {
+        match self {
+            SelectorStateArg::Attached => browser::SelectorWaitState::Attached,
+            SelectorStateArg::Visible => browser::SelectorWaitState::Visible,
+            SelectorStateArg::Hidden => browser::SelectorWaitState::Hidden,
+            SelectorStateArg::Detached => browser::SelectorWaitState::Detached,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ScrollDirectionArg {
+    Up,
+    Down,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowFile {
+    steps: Vec<WorkflowStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowStep {
+    command: Vec<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -410,7 +593,6 @@ fn ensure_runtime_or_exit(
     store: &RuntimeStore,
     session_id: Option<String>,
     command_name: &str,
-    json_output: bool,
 ) -> ActiveRuntime {
     match require_runtime(store, session_id) {
         Ok(runtime) => runtime,
@@ -418,54 +600,226 @@ fn ensure_runtime_or_exit(
             if matches!(e.code, types::ErrorCode::SessionRequired) {
                 e = session_required_error(command_name);
             }
-            if json_output {
-                let res = make_error(command_name, &e);
-                print_result(&res);
-            } else {
-                eprintln!("{}", e.message);
-            }
+            let res = make_error(command_name, &e);
+            print_result(&res);
             std::process::exit(e.exit_code);
         }
     }
 }
 
+fn runtime_command_label(command: &RuntimeCommands) -> &'static str {
+    match command {
+        RuntimeCommands::Start { .. } => "runtime.start",
+        RuntimeCommands::Stop => "runtime.stop",
+        RuntimeCommands::Status => "runtime.status",
+        RuntimeCommands::Cleanup => "runtime.cleanup",
+    }
+}
+
+fn page_command_label(command: &PageCommands) -> &'static str {
+    match command {
+        PageCommands::Goto { .. } => "page.goto",
+        PageCommands::Snapshot { .. } => "page.snapshot",
+        PageCommands::Screenshot { .. } => "page.screenshot",
+        PageCommands::Collect { .. } => "page.collect",
+        PageCommands::Markdown => "page.markdown",
+        PageCommands::Wait { .. } => "page.wait",
+        PageCommands::Js { .. } => "page.js",
+        PageCommands::Diff { .. } => "page.diff",
+        PageCommands::Dialog { .. } => "page.dialog",
+    }
+}
+
+fn input_command_label(command: &InputCommands) -> &'static str {
+    match command {
+        InputCommands::Click { .. } => "input.click",
+        InputCommands::Fill { .. } => "input.fill",
+        InputCommands::Hover { .. } => "input.hover",
+        InputCommands::Scroll { .. } => "input.scroll",
+        InputCommands::Press { .. } => "input.press",
+    }
+}
+
+fn tab_command_label(command: &TabCommands) -> &'static str {
+    match command {
+        TabCommands::List => "tab.list",
+        TabCommands::Open { .. } => "tab.open",
+        TabCommands::Switch { .. } => "tab.switch",
+        TabCommands::Close { .. } => "tab.close",
+    }
+}
+
+fn state_command_label(command: &StateCommands) -> &'static str {
+    match command {
+        StateCommands::Save { .. } => "state.save",
+        StateCommands::Load { .. } => "state.load",
+        StateCommands::List => "state.list",
+        StateCommands::Delete { .. } => "state.delete",
+    }
+}
+
+fn ref_command_label(command: &RefCommands) -> &'static str {
+    match command {
+        RefCommands::List => "ref.list",
+        RefCommands::Show { .. } => "ref.show",
+        RefCommands::Validate { .. } => "ref.validate",
+    }
+}
+
+fn log_command_label(command: &LogCommands) -> &'static str {
+    match command {
+        LogCommands::List => "logs.list",
+        LogCommands::Tail { .. } => "logs.tail",
+    }
+}
+
 fn command_label(command: &Commands) -> &'static str {
     match command {
-        Commands::Start { .. } => "start",
-        Commands::Terminate { .. } => "terminate",
-        Commands::Status => "status",
-        Commands::Navigate { .. } => "navigate",
-        Commands::Snapshot { .. } => "snapshot",
-        Commands::Screenshot { .. } => "screenshot",
-        Commands::Content => "content",
-        Commands::Collect { .. } => "collect",
-        Commands::Click { .. } => "click",
-        Commands::Fill { .. } => "fill",
-        Commands::Key { .. } => "key",
-        Commands::Hover { .. } => "hover",
-        Commands::Scroll { .. } => "scroll",
-        Commands::Wait { .. } => "wait",
-        Commands::Dialog { .. } => "dialog",
-        Commands::Eval { .. } => "eval",
-        Commands::Diff { .. } => "diff",
-        Commands::Tab { .. } => "tab",
-        Commands::Session { .. } => "session",
+        Commands::Runtime { command } => runtime_command_label(command),
+        Commands::Page { command } => page_command_label(command),
+        Commands::Input { command } => input_command_label(command),
+        Commands::Tab { command } => tab_command_label(command),
+        Commands::State { command } => state_command_label(command),
+        Commands::Ref { command } => ref_command_label(command),
+        Commands::Logs { command } => log_command_label(command),
+        Commands::Console { .. } => "console.capture",
+        Commands::Network { .. } => "network.capture",
+        Commands::Run { .. } => "run",
         Commands::Completions { .. } => "completions",
     }
 }
 
-fn should_fallback_to_cleanup_without_runtime(
-    error_code: types::ErrorCode,
-    explicit_session_id: bool,
-) -> bool {
-    matches!(error_code, types::ErrorCode::SessionRequired)
-        || (!explicit_session_id
-            && matches!(
-                error_code,
-                types::ErrorCode::SessionInvalid
-                    | types::ErrorCode::SessionTerminated
-                    | types::ErrorCode::BadInput
-            ))
+fn build_response_meta(runtime: Option<&ActiveRuntime>, started: Instant) -> types::ResponseMeta {
+    let mut meta = types::ResponseMeta::new(
+        uuid::Uuid::now_v7().to_string(),
+        chrono::Utc::now().to_rfc3339(),
+        started.elapsed().as_millis() as u64,
+    );
+    if let Some(runtime) = runtime {
+        meta = meta.with_session(types::ResponseSessionMeta {
+            session_id: runtime.session.session_id.clone(),
+            instance_id: runtime.session.instance.clone(),
+            client_id: runtime.session.client.clone(),
+        });
+    }
+    meta
+}
+
+async fn resolve_backend_from_target(
+    page: &browser::PageClient,
+    ctx: &AppContext,
+    target: &TargetArgs,
+) -> Result<(u64, serde_json::Value), CliError> {
+    let selector = target
+        .selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let reference = target
+        .reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let text = target
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    let mut kinds = 0usize;
+    if selector.is_some() {
+        kinds += 1;
+    }
+    if reference.is_some() {
+        kinds += 1;
+    }
+    if text.is_some() {
+        kinds += 1;
+    }
+    if kinds != 1 {
+        return Err(CliError::bad_input(
+            "Exactly one of --selector, --ref, or --text must be provided",
+            "Specify a single targeting strategy for this input command",
+        ));
+    }
+
+    let match_index = target.match_index.unwrap_or(0);
+    if let Some(selector) = selector {
+        let backend = page
+            .resolve_selector_backend_node_id(selector, Some(match_index))
+            .await?;
+        return Ok((
+            backend,
+            json!({
+                "strategy": "selector",
+                "selector": selector,
+                "matchIndex": match_index
+            }),
+        ));
+    }
+
+    if let Some(reference) = reference {
+        let normalized = reference.trim_start_matches('@');
+        let backend = page
+            .resolve_target_backend_node_id(ctx, &format!("@{}", normalized), None)
+            .await?;
+        return Ok((
+            backend,
+            json!({
+                "strategy": "ref",
+                "reference": format!("@{}", normalized)
+            }),
+        ));
+    }
+
+    let text = text.expect("validated");
+    let backend = page
+        .resolve_target_backend_node_id(ctx, text, Some(match_index))
+        .await?;
+    Ok((
+        backend,
+        json!({
+            "strategy": "text",
+            "text": text,
+            "matchIndex": match_index
+        }),
+    ))
+}
+
+fn wildcard_to_regex(pattern: &str) -> Result<Regex, CliError> {
+    let escaped = regex::escape(pattern);
+    let wildcard_pattern = escaped.replace("\\*", ".*");
+    let anchored = format!("^{}$", wildcard_pattern);
+    Regex::new(&anchored).map_err(|_| {
+        CliError::bad_input(
+            format!("Invalid wildcard pattern: {}", pattern),
+            "Use '*' as wildcard characters",
+        )
+    })
+}
+
+fn exit_with_error(command_name: &str, err: CliError) -> ! {
+    let res = make_error(command_name, &err);
+    print_result(&res);
+    std::process::exit(err.exit_code);
+}
+
+fn normalize_ref_key(reference: &str) -> Result<String, CliError> {
+    let normalized = reference.trim().trim_start_matches('@').to_string();
+    if normalized.is_empty() {
+        return Err(CliError::bad_input(
+            "Reference cannot be empty",
+            "Provide a ref like @e1",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn missing_ref_state_error() -> CliError {
+    CliError::bad_input(
+        "No refs available",
+        "Run 'sauron page snapshot' to capture refs first",
+    )
 }
 
 fn cleanup_stats_json(stats: CleanupStats) -> serde_json::Value {
@@ -474,18 +828,6 @@ fn cleanup_stats_json(stats: CleanupStats) -> serde_json::Value {
         "sessions": stats.sessions,
         "logs": stats.logs
     })
-}
-
-fn print_cleanup_summary(stats: CleanupStats) {
-    if stats.instances == 0 && stats.sessions == 0 && stats.logs == 0 {
-        eprintln!("Cleanup: nothing to clean up");
-        return;
-    }
-
-    eprintln!(
-        "Cleanup: removed {} stale instances, {} orphaned sessions, {} log files",
-        stats.instances, stats.sessions, stats.logs
-    );
 }
 
 fn run_cleanup(base_dir: &std::path::Path) -> Result<CleanupStats, CliError> {
@@ -609,7 +951,7 @@ fn validate_screenshot_output_path(
 async fn main() {
     let cli = Cli::parse();
 
-    if let Some(ms) = cli.wait {
+    if let Some(ms) = cli.delay_ms {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 
@@ -624,406 +966,336 @@ async fn main() {
         return;
     }
 
-    let store = match build_runtime_store() {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("{}", e.message);
-            std::process::exit(e.exit_code);
-        }
-    };
-
     let command = cli.command;
+    let session_id_flag = cli.session_id;
+    let instance_flag = cli.instance;
+    let client_flag = cli.client;
     let port_flag = cli.port;
-    let timeout_flag = cli.timeout;
+    let pid_path_flag = cli.pid_path;
+    let user_data_dir_flag = cli.user_data_dir;
+    let timeout_ms_flag = cli.timeout_ms;
     let viewport_override = match parse_optional_viewport(cli.viewport.as_deref()) {
         Ok(v) => v,
-        Err(e) => {
-            let command_name = command_label(&command);
-            let human_output = matches!(
-                command,
-                Commands::Start { .. }
-                    | Commands::Terminate { .. }
-                    | Commands::Status
-                    | Commands::Completions { .. }
-            );
-            if human_output {
-                eprintln!("{}", e.message);
-            } else {
-                let res = make_error(command_name, &e);
-                print_result(&res);
-            }
-            std::process::exit(e.exit_code);
-        }
+        Err(e) => exit_with_error(command_label(&command), e),
+    };
+
+    let store = match build_runtime_store() {
+        Ok(store) => store,
+        Err(e) => exit_with_error(command_label(&command), e),
     };
 
     match command {
-        Commands::Start {
-            #[cfg(target_os = "macos")]
-            webgl,
-            enable_gpu,
-        } => {
-            let mut session = match create_session_record(
-                &store,
-                cli.session_id.clone(),
-                cli.instance.clone(),
-                cli.client.clone(),
-                cli.pid_path.clone(),
-                cli.user_data_dir.clone(),
-            ) {
-                Ok(session) => session,
-                Err(e) => {
-                    eprintln!("{}", e.message);
-                    std::process::exit(e.exit_code);
-                }
-            };
-            let session_viewport = viewport_override.unwrap_or_default();
-            session.viewport_width = session_viewport.width;
-            session.viewport_height = session_viewport.height;
+        Commands::Runtime { command } => match command {
+            RuntimeCommands::Start {
+                webgl,
+                no_webgl,
+                gpu,
+                no_gpu,
+            } => {
+                let started_at = Instant::now();
+                let command_name = "runtime.start";
+                let mut session = match create_session_record(
+                    &store,
+                    session_id_flag.clone(),
+                    instance_flag.clone(),
+                    client_flag.clone(),
+                    pid_path_flag.clone(),
+                    user_data_dir_flag.clone(),
+                ) {
+                    Ok(session) => session,
+                    Err(e) => exit_with_error(command_name, e),
+                };
+                let session_viewport = viewport_override.unwrap_or_default();
+                session.viewport_width = session_viewport.width;
+                session.viewport_height = session_viewport.height;
 
-            let ctx = match AppContext::new(
-                &session.instance,
-                &session.client,
-                session.pid_path.clone(),
-                session.user_data_dir.clone(),
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("{}", e.message);
-                    std::process::exit(e.exit_code);
-                }
-            };
+                let ctx = match AppContext::new(
+                    &session.instance,
+                    &session.client,
+                    session.pid_path.clone(),
+                    session.user_data_dir.clone(),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => exit_with_error(command_name, e),
+                };
 
-            let timeout_ms = timeout_flag.unwrap_or(10_000);
-            #[cfg(target_os = "macos")]
-            let webgl_enabled = webgl.unwrap_or(true);
-            #[cfg(not(target_os = "macos"))]
-            let webgl_enabled = false;
+                let timeout_ms = timeout_ms_flag.unwrap_or(10_000);
+                let webgl_enabled = if webgl {
+                    true
+                } else if cfg!(target_os = "macos") {
+                    !no_webgl
+                } else {
+                    false
+                };
+                let gpu_enabled = if gpu {
+                    true
+                } else if cfg!(target_os = "macos") {
+                    !no_gpu
+                } else {
+                    false
+                };
+                let disable_gpu = !gpu_enabled;
 
-            #[cfg(target_os = "macos")]
-            let disable_gpu = !enable_gpu.unwrap_or(true);
-            #[cfg(not(target_os = "macos"))]
-            let disable_gpu = !enable_gpu.unwrap_or(false);
-            let _ = store.append_log(&session, "start", "start", None);
-            match daemon::start(
-                ctx.pid_path.clone(),
-                ctx.user_data_dir.clone(),
-                ctx.instance_lock_path.clone(),
-                port_flag,
-                timeout_ms,
-                daemon::ChromeLaunchOptions {
-                    headless: true,
-                    disable_gpu,
-                    webgl: webgl_enabled,
-                    viewport: session_viewport,
-                },
-            )
-            .await
-            {
-                Ok(r) => {
-                    if let Err(e) = activate_session(&store, &session) {
-                        let rollback = daemon::stop(
-                            &ctx.pid_path,
-                            &ctx.instance_lock_path,
-                            Some(r.port),
-                            timeout_ms,
-                        )
-                        .await;
-                        let rollback_summary = match rollback {
-                            Ok(true) => "rollback_stopped".to_string(),
-                            Ok(false) => "rollback_not_found".to_string(),
-                            Err(err) => format!("rollback_failed: {}", err.message),
-                        };
-                        let _ = store.append_log(
-                            &session,
-                            "start",
-                            "error",
-                            Some(json!({
-                                "message": e.message,
-                                "rollback": rollback_summary
-                            })),
-                        );
-                        eprintln!("{}", e.message);
-                        eprintln!("Start rollback result: {}", rollback_summary);
-                        std::process::exit(e.exit_code);
-                    }
-                    finish_runtime_command(
-                        &ActiveRuntime {
+                let _ = store.append_log(&session, command_name, "start", None);
+                match daemon::start(
+                    ctx.pid_path.clone(),
+                    ctx.user_data_dir.clone(),
+                    ctx.instance_lock_path.clone(),
+                    port_flag,
+                    timeout_ms,
+                    daemon::ChromeLaunchOptions {
+                        headless: true,
+                        disable_gpu,
+                        webgl: webgl_enabled,
+                        viewport: session_viewport,
+                    },
+                )
+                .await
+                {
+                    Ok(r) => {
+                        if let Err(e) = activate_session(&store, &session) {
+                            let rollback_summary = if r.reused_existing {
+                                "rollback_skipped_reused_daemon".to_string()
+                            } else {
+                                let rollback = daemon::stop(
+                                    &ctx.pid_path,
+                                    &ctx.instance_lock_path,
+                                    Some(r.port),
+                                    timeout_ms,
+                                )
+                                .await;
+                                match rollback {
+                                    Ok(true) => "rollback_stopped".to_string(),
+                                    Ok(false) => "rollback_not_found".to_string(),
+                                    Err(err) => format!("rollback_failed: {}", err.message),
+                                }
+                            };
+                            let _ = store.append_log(
+                                &session,
+                                command_name,
+                                "error",
+                                Some(json!({
+                                    "message": e.message,
+                                    "rollback": rollback_summary
+                                })),
+                            );
+                            exit_with_error(command_name, e);
+                        }
+
+                        let active_runtime = ActiveRuntime {
                             store: store.clone(),
                             session: session.clone(),
                             ctx: ctx.clone(),
-                        },
-                        "start",
-                        true,
-                        json!({ "port": r.port, "pid": r.pid, "store": "filesystem" }),
-                    );
-                    println!("Chrome daemon started on port {} (pid: {})", r.port, r.pid);
-                    println!("WebSocket: {}", r.ws_url);
-                    println!("Session ID: {}", session.session_id);
-                    println!("Instance ID: {}", session.instance);
-                    println!("Client ID: {}", session.client);
-                    println!(
-                        "Viewport: {}x{}",
-                        session.viewport_width, session.viewport_height
-                    );
-                    if let Ok(project_root) = resolve_project_root_path() {
-                        println!("Project binding: {}", project_root.display());
+                        };
+                        finish_runtime_command(
+                            &active_runtime,
+                            command_name,
+                            true,
+                            json!({ "port": r.port, "pid": r.pid, "store": "filesystem" }),
+                        );
+
+                        let project_root = resolve_project_root_path()
+                            .ok()
+                            .map(|path| path.to_string_lossy().to_string());
+                        let meta = build_response_meta(Some(&active_runtime), started_at);
+                        print_result(&make_success_with_meta(
+                            command_name,
+                            json!({
+                                "port": r.port,
+                                "pid": r.pid,
+                                "wsUrl": r.ws_url,
+                                "session": {
+                                    "sessionId": session.session_id,
+                                    "instance": session.instance,
+                                    "client": session.client
+                                },
+                                "viewport": {
+                                    "width": session.viewport_width,
+                                    "height": session.viewport_height
+                                },
+                                "projectRoot": project_root
+                            }),
+                            meta,
+                        ));
                     }
-                    println!(
-                        "Session is auto-resolved in this project (override with --session-id {}).",
-                        session.session_id
-                    );
-                }
-                Err(e) => {
-                    let _ = store.append_log(
-                        &session,
-                        "start",
-                        "error",
-                        Some(json!({ "message": e.message })),
-                    );
-                    eprintln!("{}", e.message);
-                    std::process::exit(e.exit_code);
+                    Err(e) => {
+                        let _ = store.append_log(
+                            &session,
+                            command_name,
+                            "error",
+                            Some(json!({ "message": e.message })),
+                        );
+                        exit_with_error(command_name, e);
+                    }
                 }
             }
-        }
+            RuntimeCommands::Stop => {
+                let started_at = Instant::now();
+                let command_name = "runtime.stop";
+                let mut runtime =
+                    ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
 
-        Commands::Terminate { cleanup } => {
-            let requested_session_id = cli.session_id.clone();
-            let explicit_session_id = requested_session_id.is_some();
-            let runtime = if cleanup {
-                match require_runtime(&store, requested_session_id.clone()) {
-                    Ok(runtime) => Some(runtime),
+                if let Err(e) = begin_runtime_command(&mut runtime, command_name) {
+                    exit_with_error(command_name, e);
+                }
+
+                let timeout_ms = timeout_ms_flag.unwrap_or(5_000);
+                let stopped = match daemon::stop(
+                    &runtime.ctx.pid_path,
+                    &runtime.ctx.instance_lock_path,
+                    port_flag,
+                    timeout_ms,
+                )
+                .await
+                {
+                    Ok(stopped) => stopped,
                     Err(e) => {
-                        if should_fallback_to_cleanup_without_runtime(e.code, explicit_session_id) {
-                            None
-                        } else {
-                            eprintln!("{}", e.message);
-                            std::process::exit(e.exit_code);
+                        finish_runtime_command(
+                            &runtime,
+                            command_name,
+                            false,
+                            json!({ "message": e.message }),
+                        );
+                        exit_with_error(command_name, e);
+                    }
+                };
+
+                let mut terminate_errors: Vec<String> = Vec::new();
+                runtime.session.mark_terminated();
+                if let Err(e) = terminate_session(&runtime.store, &runtime.session) {
+                    terminate_errors.push(e.message);
+                }
+
+                if let Err(e) = cleanup_session_state(&runtime.ctx.base_dir, &runtime.session) {
+                    terminate_errors.push(e.message);
+                }
+                if let Some(pid_path) = &runtime.session.pid_path {
+                    if let Err(e) = context::remove_pid_file(pid_path) {
+                        terminate_errors.push(e.message);
+                    }
+                }
+                if let Some(user_data_dir) = &runtime.session.user_data_dir {
+                    if let Err(e) = std::fs::remove_dir_all(user_data_dir) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            terminate_errors.push(
+                                CliError::unknown(
+                                    format!(
+                                        "Failed to remove custom Chrome user data dir {}: {}",
+                                        user_data_dir.display(),
+                                        e
+                                    ),
+                                    "Check filesystem permissions",
+                                )
+                                .message,
+                            );
                         }
                     }
                 }
-            } else {
-                Some(ensure_runtime_or_exit(
-                    &store,
-                    requested_session_id,
-                    "terminate",
-                    false,
-                ))
-            };
 
-            let Some(mut runtime) = runtime else {
-                let base_dir = match context::resolve_base_dir() {
-                    Ok(base_dir) => base_dir,
-                    Err(e) => {
-                        eprintln!("{}", e.message);
-                        std::process::exit(e.exit_code);
-                    }
-                };
-                match run_cleanup(&base_dir) {
-                    Ok(stats) => {
-                        print_cleanup_summary(stats);
-                        println!("No active runtime session found. Cleanup completed.");
-                    }
-                    Err(e) => {
-                        eprintln!("{}", e.message);
-                        std::process::exit(e.exit_code);
-                    }
-                }
-                return;
-            };
-
-            if let Err(e) = begin_runtime_command(&mut runtime, "terminate") {
-                eprintln!("{}", e.message);
-                std::process::exit(e.exit_code);
-            }
-
-            let timeout_ms = timeout_flag.unwrap_or(5_000);
-            let stopped = match daemon::stop(
-                &runtime.ctx.pid_path,
-                &runtime.ctx.instance_lock_path,
-                port_flag,
-                timeout_ms,
-            )
-            .await
-            {
-                Ok(stopped) => stopped,
-                Err(e) => {
+                if !terminate_errors.is_empty() {
                     finish_runtime_command(
                         &runtime,
-                        "terminate",
+                        command_name,
                         false,
-                        json!({ "message": e.message }),
+                        json!({ "errors": terminate_errors }),
                     );
-                    eprintln!("{}", e.message);
-                    std::process::exit(e.exit_code);
+                    exit_with_error(
+                        command_name,
+                        CliError::unknown(
+                            "runtime stop completed with cleanup errors",
+                            "Check filesystem permissions and retry",
+                        ),
+                    );
                 }
-            };
 
-            let mut terminate_errors: Vec<String> = Vec::new();
-            let mut terminate_exit_code = 1;
-
-            runtime.session.mark_terminated();
-            if let Err(e) = terminate_session(&runtime.store, &runtime.session) {
-                terminate_errors.push(e.message);
-                terminate_exit_code = e.exit_code;
+                finish_runtime_command(
+                    &runtime,
+                    command_name,
+                    true,
+                    json!({ "daemonStopped": stopped }),
+                );
+                let removed_log_artifacts = cleanup_terminate_log_artifacts(&runtime);
+                let meta = build_response_meta(Some(&runtime), started_at);
+                print_result(&make_success_with_meta(
+                    command_name,
+                    json!({
+                        "daemonStopped": stopped,
+                        "logArtifactsRemoved": removed_log_artifacts
+                    }),
+                    meta,
+                ));
             }
-
-            if let Err(e) = cleanup_session_state(&runtime.ctx.base_dir, &runtime.session) {
-                terminate_errors.push(e.message);
-                terminate_exit_code = e.exit_code;
-            }
-            if let Some(pid_path) = &runtime.session.pid_path {
-                if let Err(e) = context::remove_pid_file(pid_path) {
-                    terminate_errors.push(e.message);
-                    terminate_exit_code = e.exit_code;
+            RuntimeCommands::Status => {
+                let started_at = Instant::now();
+                let command_name = "runtime.status";
+                let mut runtime =
+                    ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
+                if let Err(e) = begin_runtime_command(&mut runtime, command_name) {
+                    exit_with_error(command_name, e);
                 }
-            }
-            if let Some(user_data_dir) = &runtime.session.user_data_dir {
-                if let Err(e) = std::fs::remove_dir_all(user_data_dir) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        let err = CliError::unknown(
-                            format!(
-                                "Failed to remove custom Chrome user data dir {}: {}",
-                                user_data_dir.display(),
-                                e
-                            ),
-                            "Check filesystem permissions",
-                        );
-                        terminate_errors.push(err.message);
-                        terminate_exit_code = err.exit_code;
-                    }
-                }
-            }
 
-            let mut cleanup_stats = None;
-            if cleanup {
-                match run_cleanup(&runtime.ctx.base_dir) {
-                    Ok(stats) => {
-                        cleanup_stats = Some(stats);
-                    }
-                    Err(e) => {
-                        terminate_errors.push(e.message);
-                        terminate_exit_code = e.exit_code;
-                    }
-                }
+                let port = runtime.ctx.resolve_port(port_flag);
+                let status_payload = match daemon::get_status(&runtime.ctx.pid_path, port).await {
+                    types::DaemonStatus::Running { pid, port, ws_url } => json!({
+                        "status": "running",
+                        "pid": pid,
+                        "port": port,
+                        "wsUrl": ws_url
+                    }),
+                    types::DaemonStatus::Stale { pid, port } => json!({
+                        "status": "stale",
+                        "pid": pid,
+                        "port": port,
+                        "hint": "Run 'sauron runtime stop' then 'sauron runtime start'"
+                    }),
+                    types::DaemonStatus::Stopped => json!({
+                        "status": "stopped"
+                    }),
+                };
+                finish_runtime_command(
+                    &runtime,
+                    command_name,
+                    true,
+                    json!({ "status": status_payload["status"] }),
+                );
+                let meta = build_response_meta(Some(&runtime), started_at);
+                print_result(&make_success_with_meta(command_name, status_payload, meta));
             }
+            RuntimeCommands::Cleanup => {
+                let started_at = Instant::now();
+                let command_name = "runtime.cleanup";
+                let base_dir = match context::resolve_base_dir() {
+                    Ok(base_dir) => base_dir,
+                    Err(e) => exit_with_error(command_name, e),
+                };
+                let stats = match run_cleanup(&base_dir) {
+                    Ok(stats) => stats,
+                    Err(e) => exit_with_error(command_name, e),
+                };
+                let meta = build_response_meta(None, started_at);
+                print_result(&make_success_with_meta(
+                    command_name,
+                    json!({ "cleanup": cleanup_stats_json(stats) }),
+                    meta,
+                ));
+            }
+        },
 
-            if !terminate_errors.is_empty() {
-                let mut details = json!({ "errors": terminate_errors.clone() });
-                if let Some(stats) = cleanup_stats {
-                    details["cleanup"] = cleanup_stats_json(stats);
-                }
-                finish_runtime_command(&runtime, "terminate", false, details);
-                if let Some(mut stats) = cleanup_stats {
-                    if cleanup {
-                        stats.logs = stats
-                            .logs
-                            .saturating_add(cleanup_terminate_log_artifacts(&runtime));
-                    }
-                    print_cleanup_summary(stats);
-                }
-                eprintln!("Terminate completed with errors:");
-                for message in terminate_errors {
-                    eprintln!("- {}", message);
-                }
-                std::process::exit(terminate_exit_code);
-            }
-
-            let mut details = json!({ "daemonStopped": stopped });
-            if let Some(stats) = cleanup_stats {
-                details["cleanup"] = cleanup_stats_json(stats);
-            }
-            finish_runtime_command(&runtime, "terminate", true, details);
-            if let Some(mut stats) = cleanup_stats {
-                if cleanup {
-                    stats.logs = stats
-                        .logs
-                        .saturating_add(cleanup_terminate_log_artifacts(&runtime));
-                }
-                print_cleanup_summary(stats);
-            }
-            if stopped {
-                println!("Runtime session terminated and Chrome daemon stopped.");
-            } else {
-                println!("Runtime session terminated. No Chrome daemon was running.");
-            }
-        }
-
-        Commands::Completions { shell } => {
-            // Note: handled earlier before runtime store initialization, but kept here for completeness.
-            let mut cmd = Cli::command();
-            let bin_name = cmd.get_name().to_string();
-            let target_shell = match shell {
-                CompletionShell::Bash => Shell::Bash,
-                CompletionShell::Zsh => Shell::Zsh,
-            };
-            generate(target_shell, &mut cmd, bin_name, &mut std::io::stdout());
-        }
-
-        command => {
-            let requires_json_output = !matches!(command, Commands::Status);
-            let mut runtime = ensure_runtime_or_exit(
-                &store,
-                cli.session_id.clone(),
-                command_label(&command),
-                requires_json_output,
-            );
+        Commands::Page { command } => {
+            let command_name = page_command_label(&command);
+            let mut runtime = ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
             let ctx = runtime.ctx.clone();
 
             match command {
-                Commands::Start { .. } | Commands::Terminate { .. } => unreachable!(),
-                Commands::Completions { .. } => unreachable!(),
-                Commands::Status => {
-                    if let Err(e) = begin_runtime_command(&mut runtime, "status") {
-                        eprintln!("{}", e.message);
-                        std::process::exit(e.exit_code);
-                    }
-
-                    let port = ctx.resolve_port(port_flag);
-                    let st = daemon::get_status(&ctx.pid_path, port).await;
-                    match st {
-                        types::DaemonStatus::Running { pid, port, ws_url } => {
-                            println!("Chrome daemon running on port {}", port);
-                            if let Some(pid) = pid {
-                                println!("PID: {}", pid);
-                            }
-                            if let Some(ws) = ws_url {
-                                println!("WebSocket: {}", ws);
-                            }
-                        }
-                        types::DaemonStatus::Stale { pid, port } => {
-                            println!("Chrome daemon state is stale.");
-                            if let Some(pid) = pid {
-                                println!("PID: {}", pid);
-                            }
-                            if let Some(port) = port {
-                                println!("Port: {}", port);
-                            }
-                            println!(
-                                "Try: sauron terminate (or remove the pidfile) then sauron start"
-                            );
-                        }
-                        types::DaemonStatus::Stopped => {
-                            println!("Chrome daemon not running.");
-                        }
-                    }
-                    finish_runtime_command(
-                        &runtime,
-                        "status",
-                        true,
-                        json!({ "status": "reported" }),
-                    );
-                }
-
-                // --- Browser commands (JSON output) ---
-                Commands::Navigate { url, wait_until } => {
+                PageCommands::Goto { url, until } => {
                     with_browser_command(
                         &mut runtime,
                         port_flag,
                         viewport_override,
-                        "navigate",
+                        "page.goto",
                         |page| async move {
-                            let timeout = Duration::from_millis(timeout_flag.unwrap_or(30_000));
-                            let outcome = page.navigate(&url, &wait_until, timeout).await?;
+                            let timeout = Duration::from_millis(timeout_ms_flag.unwrap_or(30_000));
+                            let outcome = page.navigate(&url, &until, timeout).await?;
                             #[derive(Serialize)]
                             #[serde(rename_all = "camelCase")]
                             struct Out {
@@ -1032,7 +1304,7 @@ async fn main() {
                                 status: Option<i64>,
                             }
                             Ok(make_success(
-                                "navigate",
+                                "page.goto",
                                 Out {
                                     url,
                                     status: outcome.status,
@@ -1042,19 +1314,19 @@ async fn main() {
                     )
                     .await;
                 }
-
-                Commands::Snapshot {
+                PageCommands::Snapshot {
                     interactive,
                     clickable,
                     scope,
-                    iframes,
+                    include_iframes,
+                    format,
                 } => {
                     let cmd_ctx = ctx.clone();
                     with_browser_command(
                         &mut runtime,
                         port_flag,
                         viewport_override,
-                        "snapshot",
+                        "page.snapshot",
                         move |page| {
                             let cmd_ctx = cmd_ctx.clone();
                             async move {
@@ -1062,39 +1334,52 @@ async fn main() {
                                     interactive,
                                     clickable,
                                     scope,
-                                    include_iframes: iframes,
+                                    include_iframes,
                                 };
                                 let snap = page.snapshot_and_persist(&cmd_ctx, opts).await?;
+                                let refs: Vec<serde_json::Value> = snap
+                                    .refs
+                                    .iter()
+                                    .map(|(id, reference)| {
+                                        json!({
+                                            "id": id,
+                                            "role": reference.role,
+                                            "name": reference.name,
+                                            "locator": reference.locator
+                                        })
+                                    })
+                                    .collect();
 
-                                #[derive(Serialize)]
-                                #[serde(rename_all = "camelCase")]
-                                struct Out {
-                                    url: String,
-                                    snapshot_id: u64,
-                                    ref_count: usize,
-                                    tree: String,
-                                }
+                                let payload = match format {
+                                    SnapshotFormatArg::Text => json!({
+                                        "format": "text",
+                                        "url": snap.url,
+                                        "snapshotId": snap.snapshot_id,
+                                        "refCount": snap.refs.len(),
+                                        "tree": snap.tree
+                                    }),
+                                    SnapshotFormatArg::Json => json!({
+                                        "format": "json",
+                                        "url": snap.url,
+                                        "snapshotId": snap.snapshot_id,
+                                        "refCount": snap.refs.len(),
+                                        "tree": snap.tree,
+                                        "refs": refs
+                                    }),
+                                };
 
-                                Ok(make_success(
-                                    "snapshot",
-                                    Out {
-                                        url: snap.url,
-                                        snapshot_id: snap.snapshot_id,
-                                        ref_count: snap.refs.len(),
-                                        tree: snap.tree,
-                                    },
-                                ))
+                                Ok(make_success("page.snapshot", payload))
                             }
                         },
                     )
                     .await;
                 }
-
-                Commands::Screenshot {
-                    full_page,
+                PageCommands::Screenshot {
+                    full,
                     responsive,
                     quality,
-                    path,
+                    output,
+                    output_dir,
                 } => {
                     let responsive_desktop =
                         viewport_override.unwrap_or(runtime.session.viewport());
@@ -1102,12 +1387,21 @@ async fn main() {
                         &mut runtime,
                         port_flag,
                         viewport_override,
-                        "screenshot",
+                        "page.screenshot",
                         |page| async move {
                             let quality_profile = quality.to_browser();
+                            let output_file = output.clone();
+                            let output_dir_arg = output_dir.clone();
+
+                            if !responsive && output_dir_arg.is_some() {
+                                return Err(CliError::bad_input(
+                                    "--output-dir requires --responsive",
+                                    "Add --responsive, or use --output <file> for a single screenshot",
+                                ));
+                            }
 
                             if responsive {
-                                let output_dir = if let Some(p) = path {
+                                let output_dir = if let Some(p) = output_dir_arg.or(output_file.clone()) {
                                     if p.exists() {
                                         let meta = std::fs::metadata(&p).map_err(|e| {
                                             CliError::unknown(
@@ -1125,7 +1419,7 @@ async fn main() {
                                                     "Responsive screenshots require a directory path, got file: {}",
                                                     p.display()
                                                 ),
-                                                "Use --path <directory> when --responsive is set",
+                                                "Use --output-dir <directory> when --responsive is set",
                                             ));
                                         }
                                     } else if path_looks_like_image_file(&p) {
@@ -1134,7 +1428,7 @@ async fn main() {
                                                 "Responsive screenshots require a directory path, got file-like path: {}",
                                                 p.display()
                                             ),
-                                            "Use --path <directory> when --responsive is set",
+                                            "Use --output-dir <directory> when --responsive is set",
                                         ));
                                     }
                                     p
@@ -1167,7 +1461,7 @@ async fn main() {
                                         .await?;
                                     tokio::time::sleep(Duration::from_millis(200)).await;
                                     let shot =
-                                        page.capture_screenshot(full_page, quality_profile).await?;
+                                        page.capture_screenshot(full, quality_profile).await?;
                                     let file_name =
                                         format!("screenshot-{}.{}", preset.name, shot.extension);
                                     let file_path = output_dir.join(file_name);
@@ -1200,15 +1494,16 @@ async fn main() {
                                 }
 
                                 Ok(make_success(
-                                    "screenshot",
+                                    "page.screenshot",
                                     json!({
                                         "responsive": true,
+                                        "mode": "responsive",
                                         "quality": quality.as_str(),
                                         "screenshots": screenshots
                                     }),
                                 ))
-                            } else if let Some(p) = path {
-                                let shot = page.capture_screenshot(full_page, quality_profile).await?;
+                            } else if let Some(p) = output_file {
+                                let shot = page.capture_screenshot(full, quality_profile).await?;
                                 validate_screenshot_output_path(&p, shot.extension.as_str())?;
                                 let bytes = base64::engine::general_purpose::STANDARD
                                     .decode(&shot.data)
@@ -1229,8 +1524,9 @@ async fn main() {
                                     )
                                 })?;
                                 Ok(make_success(
-                                    "screenshot",
+                                    "page.screenshot",
                                     json!({
+                                        "mode": "saved",
                                         "saved": true,
                                         "path": p.to_string_lossy(),
                                         "mime": shot.mime,
@@ -1238,10 +1534,11 @@ async fn main() {
                                     }),
                                 ))
                             } else {
-                                let shot = page.capture_screenshot(full_page, quality_profile).await?;
+                                let shot = page.capture_screenshot(full, quality_profile).await?;
                                 Ok(make_success(
-                                    "screenshot",
+                                    "page.screenshot",
                                     json!({
+                                        "mode": "inline",
                                         "data": shot.data,
                                         "mime": shot.mime,
                                         "quality": quality.as_str()
@@ -1252,43 +1549,24 @@ async fn main() {
                     )
                     .await;
                 }
-
-                Commands::Content => {
-                    with_browser_command(
-                        &mut runtime,
-                        port_flag,
-                        viewport_override,
-                        "content",
-                        |page| async move {
-                            let url = page.url().await?;
-                            let markdown = page.extract_markdown().await?;
-                            Ok(make_success(
-                                "content",
-                                json!({ "url": url, "markdown": markdown }),
-                            ))
-                        },
-                    )
-                    .await;
-                }
-
-                Commands::Collect {
+                PageCommands::Collect {
                     snapshot,
                     screenshot,
                     content,
                     interactive,
                     clickable,
                     scope,
-                    iframes,
-                    full_page,
-                    screenshot_quality,
-                    screenshot_path,
+                    include_iframes,
+                    full,
+                    quality,
+                    output,
                 } => {
                     let cmd_ctx = ctx.clone();
                     with_browser_command(
                         &mut runtime,
                         port_flag,
                         viewport_override,
-                        "collect",
+                        "page.collect",
                         move |page| {
                             let cmd_ctx = cmd_ctx.clone();
                             async move {
@@ -1313,7 +1591,7 @@ async fn main() {
                                         interactive,
                                         clickable,
                                         scope: scope_for_snapshot,
-                                        include_iframes: iframes,
+                                        include_iframes,
                                     };
                                     let snap = page_for_snapshot
                                         .snapshot_and_persist(&cmd_ctx_for_snapshot, opts)
@@ -1327,14 +1605,14 @@ async fn main() {
                                 };
 
                                 let page_for_screenshot = page.clone();
-                                let screenshot_path_for_task = screenshot_path.clone();
-                                let screenshot_quality_for_task = screenshot_quality.to_browser();
+                                let screenshot_path_for_task = output.clone();
+                                let screenshot_quality_for_task = quality.to_browser();
                                 let screenshot_fut = async move {
                                     if !screenshot {
                                         return Ok::<Option<serde_json::Value>, CliError>(None);
                                     }
                                     let shot = page_for_screenshot
-                                        .capture_screenshot(full_page, screenshot_quality_for_task)
+                                        .capture_screenshot(full, screenshot_quality_for_task)
                                         .await?;
                                     if let Some(p) = screenshot_path_for_task {
                                         validate_screenshot_output_path(
@@ -1363,13 +1641,13 @@ async fn main() {
                                             "saved": true,
                                             "path": p.to_string_lossy(),
                                             "mime": shot.mime,
-                                            "quality": screenshot_quality.as_str()
+                                            "quality": quality.as_str()
                                         })))
                                     } else {
                                         Ok(Some(json!({
                                             "data": shot.data,
                                             "mime": shot.mime,
-                                            "quality": screenshot_quality.as_str()
+                                            "quality": quality.as_str()
                                         })))
                                     }
                                 };
@@ -1453,9 +1731,9 @@ async fn main() {
                                         return Err(e);
                                     }
                                     return Err(CliError::unknown(
-                                    "collect failed",
-                                    "Try running the actions individually to isolate the failure",
-                                ));
+                                        "collect failed",
+                                        "Try running the actions individually to isolate the failure",
+                                    ));
                                 }
 
                                 #[derive(Serialize)]
@@ -1474,7 +1752,7 @@ async fn main() {
                                 }
 
                                 Ok(make_success(
-                                    "collect",
+                                    "page.collect",
                                     Out {
                                         url: url_opt,
                                         snapshot: snapshot_out,
@@ -1488,213 +1766,308 @@ async fn main() {
                     )
                     .await;
                 }
-
-                Commands::Click {
-                    target,
-                    double,
-                    nth,
-                } => {
-                    let cmd_ctx = ctx.clone();
+                PageCommands::Markdown => {
                     with_browser_command(
                         &mut runtime,
                         port_flag,
                         viewport_override,
-                        "click",
-                        move |page| {
-                            let cmd_ctx = cmd_ctx.clone();
-                            async move {
-                                let backend = page
-                                    .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
-                                    .await?;
-                                page.click(backend, double).await?;
-                                Ok(make_success(
-                                    "click",
-                                    json!({ "target": target, "clicked": true, "double": double }),
-                                ))
-                            }
-                        },
-                    )
-                    .await;
-                }
-
-                Commands::Fill { target, text, nth } => {
-                    let cmd_ctx = ctx.clone();
-                    with_browser_command(
-                        &mut runtime,
-                        port_flag,
-                        viewport_override,
-                        "fill",
-                        move |page| {
-                            let cmd_ctx = cmd_ctx.clone();
-                            async move {
-                                let backend = page
-                                    .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
-                                    .await?;
-                                let typ = page.fill(backend, &text).await?;
-                                Ok(make_success(
-                                    "fill",
-                                    json!({ "target": target, "filled": true, "type": typ }),
-                                ))
-                            }
-                        },
-                    )
-                    .await;
-                }
-
-                Commands::Key { combo } => {
-                    with_browser_command(
-                        &mut runtime,
-                        port_flag,
-                        viewport_override,
-                        "key",
+                        "page.markdown",
                         |page| async move {
-                            page.press_key(&combo).await?;
+                            let url = page.url().await?;
+                            let markdown = page.extract_markdown().await?;
                             Ok(make_success(
-                                "key",
-                                json!({ "key": combo, "pressed": true }),
+                                "page.markdown",
+                                json!({ "url": url, "markdown": markdown }),
                             ))
                         },
                     )
                     .await;
                 }
-
-                Commands::Hover { target, nth } => {
-                    let cmd_ctx = ctx.clone();
-                    with_browser_command(
-                        &mut runtime,
-                        port_flag,
-                        viewport_override,
-                        "hover",
-                        move |page| {
-                            let cmd_ctx = cmd_ctx.clone();
-                            async move {
-                                let backend = page
-                                    .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
-                                    .await?;
-                                page.hover(backend).await?;
-                                Ok(make_success(
-                                    "hover",
-                                    json!({ "target": target, "hovered": true }),
-                                ))
-                            }
-                        },
-                    )
-                    .await;
-                }
-
-                Commands::Scroll {
-                    target,
-                    amount,
-                    nth,
-                } => {
-                    let cmd_ctx = ctx.clone();
-                    with_browser_command(
-                        &mut runtime,
-                        port_flag,
-                        viewport_override,
-                        "scroll",
-                        move |page| {
-                            let cmd_ctx = cmd_ctx.clone();
-                            async move {
-                                let dir = target.to_lowercase();
-                                if matches!(dir.as_str(), "up" | "down" | "top" | "bottom") {
-                                    let expr = match dir.as_str() {
-                                        "top" => "window.scrollTo(0, 0)".to_string(),
-                                        "bottom" => {
-                                            "window.scrollTo(0, document.body.scrollHeight)"
-                                                .to_string()
-                                        }
-                                        "up" => format!("window.scrollBy(0, -{})", amount),
-                                        "down" => format!("window.scrollBy(0, {})", amount),
-                                        _ => format!("window.scrollBy(0, {})", amount),
-                                    };
-                                    let _ = page.eval(&expr).await?;
-                                    Ok(make_success(
-                                        "scroll",
-                                        json!({ "direction": dir, "amount": amount }),
-                                    ))
-                                } else {
-                                    let backend = page
-                                        .resolve_target_backend_node_id(&cmd_ctx, &target, nth)
-                                        .await?;
-                                    page.scroll_into_view(backend).await?;
-                                    Ok(make_success(
-                                        "scroll",
-                                        json!({ "target": target, "scrolledIntoView": true }),
-                                    ))
-                                }
-                            }
-                        },
-                    )
-                    .await;
-                }
-
-                Commands::Wait {
-                    duration,
+                PageCommands::Wait {
+                    for_ms,
                     text,
                     url,
                     selector,
+                    state,
+                    count,
                     idle,
                 } => {
                     with_browser_command(
                         &mut runtime,
                         port_flag,
                         viewport_override,
-                        "wait",
+                        "page.wait",
                         |page| async move {
-                            let timeout = Duration::from_millis(timeout_flag.unwrap_or(30_000));
+                            let timeout = Duration::from_millis(timeout_ms_flag.unwrap_or(30_000));
+                            if selector.is_none() && (state.is_some() || count.is_some()) {
+                                return Err(CliError::bad_input(
+                                    "--state/--count require --selector",
+                                    "Provide --selector when using --state or --count",
+                                ));
+                            }
+                            let mut selected = 0usize;
+                            if for_ms.is_some() {
+                                selected += 1;
+                            }
+                            if text.is_some() {
+                                selected += 1;
+                            }
+                            if url.is_some() {
+                                selected += 1;
+                            }
+                            if selector.is_some() {
+                                selected += 1;
+                            }
+                            if idle {
+                                selected += 1;
+                            }
+                            if selected != 1 {
+                                return Err(CliError::bad_input(
+                                    "Provide exactly one wait condition",
+                                    "Use exactly one of --for-ms/--text/--url/--selector/--idle",
+                                ));
+                            }
 
-                            if let Some(ms) = duration {
+                            if let Some(ms) = for_ms {
                                 tokio::time::sleep(Duration::from_millis(ms)).await;
                                 return Ok(make_success(
-                                    "wait",
-                                    json!({ "waited": true, "duration": ms }),
+                                    "page.wait",
+                                    json!({ "waited": true, "forMs": ms }),
                                 ));
                             }
                             if let Some(t) = text {
                                 page.wait_for_text(&t, timeout).await?;
                                 return Ok(make_success(
-                                    "wait",
+                                    "page.wait",
                                     json!({ "waited": true, "text": t }),
                                 ));
                             }
                             if let Some(u) = url {
                                 page.wait_for_url(&u, timeout).await?;
                                 return Ok(make_success(
-                                    "wait",
+                                    "page.wait",
                                     json!({ "waited": true, "url": u }),
                                 ));
                             }
                             if let Some(sel) = selector {
-                                page.wait_for_selector(&sel, timeout).await?;
+                                let wait_state =
+                                    state.unwrap_or(SelectorStateArg::Attached).to_browser();
+                                let outcome = page
+                                    .wait_for_selector_state(&sel, wait_state, count, timeout)
+                                    .await?;
                                 return Ok(make_success(
-                                    "wait",
-                                    json!({ "waited": true, "selector": sel }),
+                                    "page.wait",
+                                    json!({
+                                        "waited": true,
+                                        "selector": sel,
+                                        "state": wait_state.as_str(),
+                                        "count": outcome.count,
+                                        "visibleCount": outcome.visible_count,
+                                        "expectedCount": outcome.expected_count
+                                    }),
                                 ));
                             }
                             if idle {
                                 page.wait_for_idle(timeout).await?;
                                 return Ok(make_success(
-                                    "wait",
+                                    "page.wait",
                                     json!({ "waited": true, "idle": true }),
                                 ));
                             }
 
-                            Err(CliError::bad_input(
-                                "No wait condition provided",
-                                "Provide a duration (ms) or one of --text/--url/--selector/--idle",
+                            Err(CliError::unknown(
+                                "wait condition resolution failed",
+                                "Retry command",
                             ))
                         },
                     )
                     .await;
                 }
-
-                Commands::Dialog { action, text } => {
+                PageCommands::Js { expression } => {
                     with_browser_command(
                         &mut runtime,
                         port_flag,
                         viewport_override,
-                        "dialog",
+                        "page.js",
+                        |page| async move {
+                            let value = page.eval(&expression).await?;
+                            Ok(make_success("page.js", json!({ "result": value })))
+                        },
+                    )
+                    .await;
+                }
+                PageCommands::Diff { from, to, format } => {
+                    let command_name = "page.diff";
+                    let started_at = Instant::now();
+                    if let Err(e) = begin_runtime_command(&mut runtime, command_name) {
+                        exit_with_error(command_name, e);
+                    }
+
+                    let state = match browser::load_ref_state(&ctx).await {
+                        Ok(Some(state)) => state,
+                        Ok(None) => {
+                            let err = CliError::bad_input(
+                                "No snapshots available",
+                                "Run 'sauron page snapshot' first",
+                            );
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": err.message }),
+                            );
+                            exit_with_error(command_name, err);
+                        }
+                        Err(e) => {
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": e.message }),
+                            );
+                            exit_with_error(command_name, e);
+                        }
+                    };
+
+                    let to_id = to.unwrap_or(state.snapshot_id);
+                    if to_id == 0 {
+                        let err = CliError::bad_input(
+                            "Invalid --to snapshot id",
+                            "--to must be greater than zero",
+                        );
+                        finish_runtime_command(
+                            &runtime,
+                            command_name,
+                            false,
+                            json!({ "message": err.message }),
+                        );
+                        exit_with_error(command_name, err);
+                    }
+
+                    let from_id = from.unwrap_or(to_id.saturating_sub(1));
+                    if from_id == 0 {
+                        let err = CliError::bad_input(
+                            "Need at least two snapshots to diff",
+                            "Provide --from/--to, or capture another snapshot",
+                        );
+                        finish_runtime_command(
+                            &runtime,
+                            command_name,
+                            false,
+                            json!({ "message": err.message }),
+                        );
+                        exit_with_error(command_name, err);
+                    }
+                    if from_id == to_id {
+                        let err = CliError::bad_input(
+                            "--from and --to cannot be equal",
+                            "Choose different snapshot ids",
+                        );
+                        finish_runtime_command(
+                            &runtime,
+                            command_name,
+                            false,
+                            json!({ "message": err.message }),
+                        );
+                        exit_with_error(command_name, err);
+                    }
+
+                    let prev = match browser::load_snapshot(&ctx, from_id).await {
+                        Ok(Some(prev)) => prev,
+                        Ok(None) => {
+                            let err = CliError::unknown(
+                                format!("Snapshot {} not found", from_id),
+                                "Run 'sauron page snapshot' again",
+                            );
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": err.message }),
+                            );
+                            exit_with_error(command_name, err);
+                        }
+                        Err(e) => {
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": e.message }),
+                            );
+                            exit_with_error(command_name, e);
+                        }
+                    };
+
+                    let after = if to_id == state.snapshot_id {
+                        state.last_snapshot
+                    } else {
+                        match browser::load_snapshot(&ctx, to_id).await {
+                            Ok(Some(after)) => after,
+                            Ok(None) => {
+                                let err = CliError::unknown(
+                                    format!("Snapshot {} not found", to_id),
+                                    "Run 'sauron page snapshot' again",
+                                );
+                                finish_runtime_command(
+                                    &runtime,
+                                    command_name,
+                                    false,
+                                    json!({ "message": err.message }),
+                                );
+                                exit_with_error(command_name, err);
+                            }
+                            Err(e) => {
+                                finish_runtime_command(
+                                    &runtime,
+                                    command_name,
+                                    false,
+                                    json!({ "message": e.message }),
+                                );
+                                exit_with_error(command_name, e);
+                            }
+                        }
+                    };
+                    let d = diff::diff_snapshots(&prev, &after);
+
+                    if format == "json" {
+                        let meta = build_response_meta(Some(&runtime), started_at);
+                        print_result(&make_success_with_meta(
+                            command_name,
+                            json!({
+                                "added": d.added,
+                                "removed": d.removed,
+                                "changed": d.changed,
+                                "unified": d.unified,
+                                "fromSnapshotId": from_id,
+                                "toSnapshotId": to_id
+                            }),
+                            meta,
+                        ));
+                    } else {
+                        let meta = build_response_meta(Some(&runtime), started_at);
+                        print_result(&make_success_with_meta(
+                            command_name,
+                            json!({
+                                "unified": d.unified,
+                                "fromSnapshotId": from_id,
+                                "toSnapshotId": to_id
+                            }),
+                            meta,
+                        ));
+                    }
+                    finish_runtime_command(
+                        &runtime,
+                        command_name,
+                        true,
+                        json!({ "fromSnapshotId": from_id, "toSnapshotId": to_id }),
+                    );
+                }
+                PageCommands::Dialog { action, text } => {
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "page.dialog",
                         |page| async move {
                             let timeout = Duration::from_millis(2_000);
                             let d = page.next_dialog(timeout).await?;
@@ -1721,7 +2094,7 @@ async fn main() {
 
                             page.handle_dialog(accept, text.as_deref()).await?;
                             Ok(make_success(
-                                "dialog",
+                                "page.dialog",
                                 json!({
                                     "action": action,
                                     "type": d.dialog_type,
@@ -1733,310 +2106,1008 @@ async fn main() {
                     )
                     .await;
                 }
+            }
+        }
 
-                Commands::Eval { expression } => {
+        Commands::Input { command } => {
+            let command_name = input_command_label(&command);
+            let mut runtime = ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
+            let ctx = runtime.ctx.clone();
+
+            match command {
+                InputCommands::Click { target, double } => {
+                    let cmd_ctx = ctx.clone();
                     with_browser_command(
                         &mut runtime,
                         port_flag,
                         viewport_override,
-                        "eval",
-                        |page| async move {
-                            let value = page.eval(&expression).await?;
-                            Ok(make_success("eval", json!({ "result": value })))
+                        "input.click",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                let (backend, target_resolution) =
+                                    resolve_backend_from_target(&page, &cmd_ctx, &target).await?;
+                                page.click(backend, double).await?;
+                                Ok(make_success(
+                                    "input.click",
+                                    json!({
+                                        "clicked": true,
+                                        "double": double,
+                                        "targetResolution": target_resolution
+                                    }),
+                                ))
+                            }
                         },
                     )
                     .await;
                 }
-
-                Commands::Diff { format } => {
-                    if let Err(e) = begin_runtime_command(&mut runtime, "diff") {
-                        let res = make_error("diff", &e);
-                        print_result(&res);
-                        std::process::exit(e.exit_code);
-                    }
-
-                    let state = browser::load_ref_state(&ctx).await.unwrap_or(None);
-                    let Some(state) = state else {
-                        let err = CliError::bad_input(
-                            "No snapshots available",
-                            "Run 'sauron snapshot' first",
-                        );
-                        print_result(&make_error("diff", &err));
-                        finish_runtime_command(
-                            &runtime,
-                            "diff",
-                            false,
-                            json!({ "message": err.message }),
-                        );
-                        std::process::exit(err.exit_code);
-                    };
-
-                    let snapshot_id = state.snapshot_id;
-                    if snapshot_id < 2 {
-                        let err = CliError::bad_input(
-                            "Need at least 2 snapshots to diff",
-                            "Run 'sauron snapshot' twice",
-                        );
-                        print_result(&make_error("diff", &err));
-                        finish_runtime_command(
-                            &runtime,
-                            "diff",
-                            false,
-                            json!({ "message": err.message }),
-                        );
-                        std::process::exit(err.exit_code);
-                    }
-
-                    let prev_id = snapshot_id - 1;
-                    let prev = browser::load_snapshot(&ctx, prev_id).await.unwrap_or(None);
-                    let Some(prev) = prev else {
-                        let err = CliError::unknown(
-                            format!("Previous snapshot {} not found", prev_id),
-                            "Run 'sauron snapshot' again",
-                        );
-                        print_result(&make_error("diff", &err));
-                        finish_runtime_command(
-                            &runtime,
-                            "diff",
-                            false,
-                            json!({ "message": err.message }),
-                        );
-                        std::process::exit(err.exit_code);
-                    };
-
-                    let after = state.last_snapshot;
-                    let d = diff::diff_snapshots(&prev, &after);
-
-                    if format == "json" {
-                        print_result(&make_success(
-                            "diff",
-                            json!({
-                                "added": d.added,
-                                "removed": d.removed,
-                                "changed": d.changed,
-                                "unified": d.unified,
-                                "snapshotId": snapshot_id,
-                                "previousId": prev_id
-                            }),
-                        ));
-                    } else {
-                        print_result(&make_success(
-                            "diff",
-                            json!({
-                                "unified": d.unified,
-                                "snapshotId": snapshot_id,
-                                "previousId": prev_id
-                            }),
-                        ));
-                    }
-                    finish_runtime_command(
-                        &runtime,
-                        "diff",
-                        true,
-                        json!({ "snapshotId": snapshot_id, "previousId": prev_id }),
-                    );
-                }
-
-                Commands::Tab { command } => {
+                InputCommands::Fill { target, value } => {
                     let cmd_ctx = ctx.clone();
-                    with_browser_only_command(&mut runtime, port_flag, "tab", move |browser| {
-                        let cmd_ctx = cmd_ctx.clone();
-                        async move {
-                            match command {
-                                TabCommands::List => {
-                                    let bound_target_id = browser::get_bound_target_id(&cmd_ctx)?;
-                                    let pages = browser.get_targets().await?;
-                                    let pages: Vec<_> = pages
-                                        .into_iter()
-                                        .filter(|t| t.target_type == "page")
-                                        .map(|t| {
-                                            let bound = bound_target_id.as_deref()
-                                                == Some(t.target_id.as_str());
-                                            json!({
-                                                "targetId": t.target_id,
-                                                "url": t.url,
-                                                "title": t.title,
-                                                "isAttached": t.attached,
-                                                "bound": bound,
-                                            })
-                                        })
-                                        .collect();
-
-                                    Ok(make_success(
-                                        "tab",
-                                        json!({
-                                            "action": "list",
-                                            "boundTargetId": bound_target_id,
-                                            "tabs": pages
-                                        }),
-                                    ))
-                                }
-
-                                TabCommands::Open { url } => {
-                                    let target_id = browser.create_target(&url).await?;
-                                    browser.activate_target(&target_id).await?;
-                                    browser::set_bound_target_id(&cmd_ctx, &target_id)?;
-
-                                    Ok(make_success(
-                                        "tab",
-                                        json!({
-                                            "action": "open",
-                                            "url": url,
-                                            "targetId": target_id,
-                                            "bound": true
-                                        }),
-                                    ))
-                                }
-
-                                TabCommands::Switch { index } => {
-                                    let pages = browser.get_targets().await?;
-                                    let pages: Vec<_> = pages
-                                        .into_iter()
-                                        .filter(|t| t.target_type == "page")
-                                        .collect();
-                                    if index >= pages.len() {
-                                        return Err(CliError::bad_input(
-                                            format!(
-                                                "Tab index {} out of range ({} tabs)",
-                                                index,
-                                                pages.len()
-                                            ),
-                                            "Run `sauron tab list` and choose a valid index",
-                                        ));
-                                    }
-                                    let target_id = pages[index].target_id.clone();
-                                    browser.activate_target(&target_id).await?;
-                                    browser::set_bound_target_id(&cmd_ctx, &target_id)?;
-
-                                    Ok(make_success(
-                                        "tab",
-                                        json!({
-                                            "action": "switch",
-                                            "index": index,
-                                            "targetId": target_id,
-                                            "bound": true
-                                        }),
-                                    ))
-                                }
-
-                                TabCommands::Close { index } => {
-                                    let pages = browser.get_targets().await?;
-                                    let pages: Vec<_> = pages
-                                        .into_iter()
-                                        .filter(|t| t.target_type == "page")
-                                        .collect();
-                                    if index >= pages.len() {
-                                        return Err(CliError::bad_input(
-                                            format!(
-                                                "Tab index {} out of range ({} tabs)",
-                                                index,
-                                                pages.len()
-                                            ),
-                                            "Run `sauron tab list` and choose a valid index",
-                                        ));
-                                    }
-
-                                    let target_id = pages[index].target_id.clone();
-                                    let bound_target_id = browser::get_bound_target_id(&cmd_ctx)?;
-                                    let was_bound =
-                                        bound_target_id.as_deref() == Some(target_id.as_str());
-
-                                    browser.close_target(&target_id).await?;
-
-                                    let mut new_bound: Option<String> = None;
-                                    if was_bound {
-                                        let remaining = browser.get_targets().await?;
-                                        let remaining: Vec<_> = remaining
-                                            .into_iter()
-                                            .filter(|t| t.target_type == "page")
-                                            .collect();
-
-                                        if let Some(t) = remaining
-                                            .iter()
-                                            .find(|t| t.url != "about:blank")
-                                            .or_else(|| remaining.first())
-                                        {
-                                            browser.activate_target(&t.target_id).await?;
-                                            browser::set_bound_target_id(&cmd_ctx, &t.target_id)?;
-                                            new_bound = Some(t.target_id.clone());
-                                        } else {
-                                            let id = browser.create_target("about:blank").await?;
-                                            browser.activate_target(&id).await?;
-                                            browser::set_bound_target_id(&cmd_ctx, &id)?;
-                                            new_bound = Some(id);
-                                        }
-                                    }
-
-                                    Ok(make_success(
-                                        "tab",
-                                        json!({
-                                            "action": "close",
-                                            "index": index,
-                                            "closedTargetId": target_id,
-                                            "wasBound": was_bound,
-                                            "newBoundTargetId": new_bound
-                                        }),
-                                    ))
-                                }
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "input.fill",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                let (backend, target_resolution) =
+                                    resolve_backend_from_target(&page, &cmd_ctx, &target).await?;
+                                let typ = page.fill(backend, &value).await?;
+                                Ok(make_success(
+                                    "input.fill",
+                                    json!({
+                                        "filled": true,
+                                        "type": typ,
+                                        "targetResolution": target_resolution
+                                    }),
+                                ))
                             }
-                        }
-                    })
+                        },
+                    )
                     .await;
                 }
-
-                Commands::Session { command } => {
+                InputCommands::Hover { target } => {
                     let cmd_ctx = ctx.clone();
-                    with_browser_command(&mut runtime, port_flag, viewport_override, "session", move |page| {
-                        let cmd_ctx = cmd_ctx.clone();
-                        async move {
-                            match command {
-                                SessionCommands::Save { name } => {
-                                    let data =
-                                        session::save_session(&cmd_ctx, &name, &page).await?;
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "input.hover",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                let (backend, target_resolution) =
+                                    resolve_backend_from_target(&page, &cmd_ctx, &target).await?;
+                                page.hover(backend).await?;
+                                Ok(make_success(
+                                    "input.hover",
+                                    json!({
+                                        "hovered": true,
+                                        "targetResolution": target_resolution
+                                    }),
+                                ))
+                            }
+                        },
+                    )
+                    .await;
+                }
+                InputCommands::Scroll {
+                    direction,
+                    amount,
+                    target,
+                } => {
+                    let cmd_ctx = ctx.clone();
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "input.scroll",
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                if let Some(direction) = direction {
+                                    if !target.is_empty() {
+                                        return Err(CliError::bad_input(
+                                            "Do not combine --direction with --selector/--ref/--text",
+                                            "Use directional scroll or target scroll, not both",
+                                        ));
+                                    }
+                                    let dir = match direction {
+                                        ScrollDirectionArg::Up => "up",
+                                        ScrollDirectionArg::Down => "down",
+                                        ScrollDirectionArg::Top => "top",
+                                        ScrollDirectionArg::Bottom => "bottom",
+                                    };
+                                    let expr = match direction {
+                                        ScrollDirectionArg::Top => "window.scrollTo(0, 0)".to_string(),
+                                        ScrollDirectionArg::Bottom => {
+                                            "window.scrollTo(0, document.body.scrollHeight)"
+                                                .to_string()
+                                        }
+                                        ScrollDirectionArg::Up => format!("window.scrollBy(0, -{})", amount),
+                                        ScrollDirectionArg::Down => format!("window.scrollBy(0, {})", amount),
+                                    };
+                                    let _ = page.eval(&expr).await?;
                                     Ok(make_success(
-                                        "session",
+                                        "input.scroll",
+                                        json!({ "direction": dir, "amount": amount }),
+                                    ))
+                                } else {
+                                    let (backend, target_resolution) =
+                                        resolve_backend_from_target(&page, &cmd_ctx, &target)
+                                            .await?;
+                                    page.scroll_into_view(backend).await?;
+                                    Ok(make_success(
+                                        "input.scroll",
                                         json!({
-                                            "action": "save",
-                                            "name": data.name,
-                                            "savedAt": data.saved_at,
-                                            "url": data.url,
-                                            "cookieCount": data.cookies.len()
+                                            "scrolledIntoView": true,
+                                            "targetResolution": target_resolution
                                         }),
-                                    ))
-                                }
-                                SessionCommands::Load { name } => {
-                                    let data =
-                                        session::load_session(&cmd_ctx, &name, &page).await?;
-                                    Ok(make_success(
-                                        "session",
-                                        json!({
-                                            "action": "load",
-                                            "name": data.name,
-                                            "url": data.url,
-                                            "cookieCount": data.cookies.len()
-                                        }),
-                                    ))
-                                }
-                                SessionCommands::List => {
-                                    let list = session::list_sessions(&cmd_ctx).await?;
-                                    Ok(make_success(
-                                        "session",
-                                        json!({ "action": "list", "sessions": list }),
-                                    ))
-                                }
-                                SessionCommands::Delete { name } => {
-                                    let ok = session::delete_session(&cmd_ctx, &name).await?;
-                                    Ok(make_success(
-                                        "session",
-                                        json!({ "action": "delete", "name": name, "deleted": ok }),
                                     ))
                                 }
                             }
-                        }
-                    })
+                        },
+                    )
+                    .await;
+                }
+                InputCommands::Press { combo } => {
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        "input.press",
+                        |page| async move {
+                            page.press_key(&combo).await?;
+                            Ok(make_success(
+                                "input.press",
+                                json!({ "key": combo, "pressed": true }),
+                            ))
+                        },
+                    )
                     .await;
                 }
             }
+        }
+
+        Commands::Tab { command } => {
+            let command_name = tab_command_label(&command);
+            let mut runtime = ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
+            let ctx = runtime.ctx.clone();
+            let cmd_ctx = ctx.clone();
+
+            with_browser_only_command(&mut runtime, port_flag, command_name, move |browser| {
+                let cmd_ctx = cmd_ctx.clone();
+                async move {
+                    match command {
+                        TabCommands::List => {
+                            let bound_target_id = browser::get_bound_target_id(&cmd_ctx)?;
+                            let pages = browser.get_targets().await?;
+                            let pages: Vec<_> = pages
+                                .into_iter()
+                                .filter(|t| t.target_type == "page")
+                                .map(|t| {
+                                    let bound =
+                                        bound_target_id.as_deref() == Some(t.target_id.as_str());
+                                    json!({
+                                        "targetId": t.target_id,
+                                        "url": t.url,
+                                        "title": t.title,
+                                        "isAttached": t.attached,
+                                        "bound": bound,
+                                    })
+                                })
+                                .collect();
+
+                            Ok(make_success(
+                                command_name,
+                                json!({
+                                    "action": "list",
+                                    "boundTargetId": bound_target_id,
+                                    "tabs": pages
+                                }),
+                            ))
+                        }
+
+                        TabCommands::Open { url } => {
+                            let target_id = browser.create_target(&url).await?;
+                            browser.activate_target(&target_id).await?;
+                            browser::set_bound_target_id(&cmd_ctx, &target_id)?;
+
+                            Ok(make_success(
+                                command_name,
+                                json!({
+                                    "action": "open",
+                                    "url": url,
+                                    "targetId": target_id,
+                                    "bound": true
+                                }),
+                            ))
+                        }
+
+                        TabCommands::Switch { index } => {
+                            let pages = browser.get_targets().await?;
+                            let pages: Vec<_> = pages
+                                .into_iter()
+                                .filter(|t| t.target_type == "page")
+                                .collect();
+                            if index >= pages.len() {
+                                return Err(CliError::bad_input(
+                                    format!(
+                                        "Tab index {} out of range ({} tabs)",
+                                        index,
+                                        pages.len()
+                                    ),
+                                    "Run `sauron tab list` and choose a valid index",
+                                ));
+                            }
+                            let target_id = pages[index].target_id.clone();
+                            browser.activate_target(&target_id).await?;
+                            browser::set_bound_target_id(&cmd_ctx, &target_id)?;
+
+                            Ok(make_success(
+                                command_name,
+                                json!({
+                                    "action": "switch",
+                                    "index": index,
+                                    "targetId": target_id,
+                                    "bound": true
+                                }),
+                            ))
+                        }
+
+                        TabCommands::Close { index } => {
+                            let pages = browser.get_targets().await?;
+                            let pages: Vec<_> = pages
+                                .into_iter()
+                                .filter(|t| t.target_type == "page")
+                                .collect();
+                            if index >= pages.len() {
+                                return Err(CliError::bad_input(
+                                    format!(
+                                        "Tab index {} out of range ({} tabs)",
+                                        index,
+                                        pages.len()
+                                    ),
+                                    "Run `sauron tab list` and choose a valid index",
+                                ));
+                            }
+
+                            let target_id = pages[index].target_id.clone();
+                            let bound_target_id = browser::get_bound_target_id(&cmd_ctx)?;
+                            let was_bound = bound_target_id.as_deref() == Some(target_id.as_str());
+
+                            browser.close_target(&target_id).await?;
+
+                            let mut new_bound: Option<String> = None;
+                            if was_bound {
+                                let remaining = browser.get_targets().await?;
+                                let remaining: Vec<_> = remaining
+                                    .into_iter()
+                                    .filter(|t| t.target_type == "page")
+                                    .collect();
+
+                                if let Some(t) = remaining
+                                    .iter()
+                                    .find(|t| t.url != "about:blank")
+                                    .or_else(|| remaining.first())
+                                {
+                                    browser.activate_target(&t.target_id).await?;
+                                    browser::set_bound_target_id(&cmd_ctx, &t.target_id)?;
+                                    new_bound = Some(t.target_id.clone());
+                                } else {
+                                    let id = browser.create_target("about:blank").await?;
+                                    browser.activate_target(&id).await?;
+                                    browser::set_bound_target_id(&cmd_ctx, &id)?;
+                                    new_bound = Some(id);
+                                }
+                            }
+
+                            Ok(make_success(
+                                command_name,
+                                json!({
+                                    "action": "close",
+                                    "index": index,
+                                    "closedTargetId": target_id,
+                                    "wasBound": was_bound,
+                                    "newBoundTargetId": new_bound
+                                }),
+                            ))
+                        }
+                    }
+                }
+            })
+            .await;
+        }
+
+        Commands::State { command } => {
+            let command_name = state_command_label(&command);
+            let mut runtime = ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
+            let ctx = runtime.ctx.clone();
+            let cmd_ctx = ctx.clone();
+
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let cmd_ctx = cmd_ctx.clone();
+                    async move {
+                        match command {
+                            StateCommands::Save { name } => {
+                                let data = session::save_session(&cmd_ctx, &name, &page).await?;
+                                Ok(make_success(
+                                    command_name,
+                                    json!({
+                                        "action": "save",
+                                        "name": data.name,
+                                        "savedAt": data.saved_at,
+                                        "url": data.url,
+                                        "cookieCount": data.cookies.len()
+                                    }),
+                                ))
+                            }
+                            StateCommands::Load { name } => {
+                                let data = session::load_session(&cmd_ctx, &name, &page).await?;
+                                Ok(make_success(
+                                    command_name,
+                                    json!({
+                                        "action": "load",
+                                        "name": data.name,
+                                        "url": data.url,
+                                        "cookieCount": data.cookies.len()
+                                    }),
+                                ))
+                            }
+                            StateCommands::List => {
+                                let list = session::list_sessions(&cmd_ctx).await?;
+                                Ok(make_success(
+                                    command_name,
+                                    json!({ "action": "list", "sessions": list }),
+                                ))
+                            }
+                            StateCommands::Delete { name } => {
+                                let ok = session::delete_session(&cmd_ctx, &name).await?;
+                                Ok(make_success(
+                                    command_name,
+                                    json!({ "action": "delete", "name": name, "deleted": ok }),
+                                ))
+                            }
+                        }
+                    }
+                },
+            )
+            .await;
+        }
+
+        Commands::Ref { command } => {
+            let command_name = ref_command_label(&command);
+            let mut runtime = ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
+            let ctx = runtime.ctx.clone();
+
+            match command {
+                RefCommands::List => {
+                    let started_at = Instant::now();
+                    if let Err(e) = begin_runtime_command(&mut runtime, command_name) {
+                        exit_with_error(command_name, e);
+                    }
+                    let state = match browser::load_ref_state(&ctx).await {
+                        Ok(Some(state)) => state,
+                        Ok(None) => {
+                            let err = missing_ref_state_error();
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": err.message }),
+                            );
+                            exit_with_error(command_name, err);
+                        }
+                        Err(e) => {
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": e.message }),
+                            );
+                            exit_with_error(command_name, e);
+                        }
+                    };
+
+                    let mut refs: Vec<_> = state.refs.into_iter().collect();
+                    refs.sort_by(|a, b| a.0.cmp(&b.0));
+                    let refs: Vec<_> = refs
+                        .into_iter()
+                        .map(|(id, value)| {
+                            json!({
+                                "id": id,
+                                "role": value.role,
+                                "name": value.name,
+                                "locator": value.locator
+                            })
+                        })
+                        .collect();
+                    let ref_count = refs.len();
+                    let meta = build_response_meta(Some(&runtime), started_at);
+
+                    print_result(&make_success_with_meta(
+                        command_name,
+                        json!({
+                            "snapshotId": state.snapshot_id,
+                            "url": state.url,
+                            "refCount": ref_count,
+                            "refs": refs
+                        }),
+                        meta,
+                    ));
+                    finish_runtime_command(
+                        &runtime,
+                        command_name,
+                        true,
+                        json!({ "refCount": ref_count }),
+                    );
+                }
+                RefCommands::Show { reference } => {
+                    let started_at = Instant::now();
+                    if let Err(e) = begin_runtime_command(&mut runtime, command_name) {
+                        exit_with_error(command_name, e);
+                    }
+                    let reference = match normalize_ref_key(&reference) {
+                        Ok(reference) => reference,
+                        Err(e) => {
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": e.message }),
+                            );
+                            exit_with_error(command_name, e);
+                        }
+                    };
+
+                    let state = match browser::load_ref_state(&ctx).await {
+                        Ok(Some(state)) => state,
+                        Ok(None) => {
+                            let err = missing_ref_state_error();
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": err.message }),
+                            );
+                            exit_with_error(command_name, err);
+                        }
+                        Err(e) => {
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": e.message }),
+                            );
+                            exit_with_error(command_name, e);
+                        }
+                    };
+
+                    let entry = match state.refs.get(reference.as_str()) {
+                        Some(entry) => entry,
+                        None => {
+                            let err = CliError::bad_input(
+                                format!("Ref @{} not found", reference),
+                                "Run 'sauron ref list' to inspect available refs",
+                            );
+                            finish_runtime_command(
+                                &runtime,
+                                command_name,
+                                false,
+                                json!({ "message": err.message }),
+                            );
+                            exit_with_error(command_name, err);
+                        }
+                    };
+
+                    let meta = build_response_meta(Some(&runtime), started_at);
+                    print_result(&make_success_with_meta(
+                        command_name,
+                        json!({
+                            "snapshotId": state.snapshot_id,
+                            "url": state.url,
+                            "ref": {
+                                "id": reference,
+                                "role": entry.role,
+                                "name": entry.name,
+                                "locator": entry.locator
+                            }
+                        }),
+                        meta,
+                    ));
+                    finish_runtime_command(&runtime, command_name, true, json!({}));
+                }
+                RefCommands::Validate { reference } => {
+                    let cmd_ctx = ctx.clone();
+                    with_browser_command(
+                        &mut runtime,
+                        port_flag,
+                        viewport_override,
+                        command_name,
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
+                                let state = browser::load_ref_state(&cmd_ctx)
+                                    .await?
+                                    .ok_or_else(missing_ref_state_error)?;
+
+                                let refs_to_check: Vec<String> = if let Some(reference) = reference
+                                {
+                                    vec![normalize_ref_key(&reference)?]
+                                } else {
+                                    let mut ids: Vec<String> = state.refs.keys().cloned().collect();
+                                    ids.sort();
+                                    ids
+                                };
+
+                                if refs_to_check.is_empty() {
+                                    return Err(missing_ref_state_error());
+                                }
+
+                                let mut valid: Vec<String> = Vec::new();
+                                let mut invalid: Vec<serde_json::Value> = Vec::new();
+                                for ref_id in refs_to_check {
+                                    if !state.refs.contains_key(ref_id.as_str()) {
+                                        invalid.push(json!({
+                                            "id": ref_id,
+                                            "code": types::ErrorCode::RefNotFound,
+                                            "message": "Ref not found in current snapshot state"
+                                        }));
+                                        continue;
+                                    }
+                                    let target = format!("@{}", ref_id);
+                                    match page
+                                        .resolve_target_backend_node_id(&cmd_ctx, &target, None)
+                                        .await
+                                    {
+                                        Ok(_) => valid.push(ref_id),
+                                        Err(e) => invalid.push(json!({
+                                            "id": target,
+                                            "code": e.code,
+                                            "message": e.message,
+                                            "hint": e.hint,
+                                            "recoverable": e.recoverable
+                                        })),
+                                    }
+                                }
+
+                                Ok(make_success(
+                                    command_name,
+                                    json!({
+                                        "snapshotId": state.snapshot_id,
+                                        "checked": valid.len() + invalid.len(),
+                                        "validCount": valid.len(),
+                                        "valid": valid,
+                                        "invalidCount": invalid.len(),
+                                        "invalid": invalid
+                                    }),
+                                ))
+                            }
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+
+        Commands::Logs { command } => match command {
+            LogCommands::List => {
+                let started_at = Instant::now();
+                let command_name = "logs.list";
+                let base_dir = match context::resolve_base_dir() {
+                    Ok(base_dir) => base_dir,
+                    Err(e) => exit_with_error(command_name, e),
+                };
+                let logs_dir = base_dir.join("runtime").join("logs");
+                let mut logs: Vec<serde_json::Value> = Vec::new();
+
+                match std::fs::read_dir(&logs_dir) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
+                                continue;
+                            }
+                            let Ok(metadata) = entry.metadata() else {
+                                continue;
+                            };
+                            let session_id = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let modified = metadata
+                                .modified()
+                                .ok()
+                                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+                            logs.push(json!({
+                                "sessionId": session_id,
+                                "path": path.to_string_lossy(),
+                                "sizeBytes": metadata.len(),
+                                "modifiedAt": modified
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            exit_with_error(
+                                command_name,
+                                CliError::unknown(
+                                    format!(
+                                        "Failed to read logs directory {}: {}",
+                                        logs_dir.display(),
+                                        e
+                                    ),
+                                    "Check filesystem permissions",
+                                ),
+                            );
+                        }
+                    }
+                }
+
+                logs.sort_by(|a, b| {
+                    a.get("sessionId")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .cmp(
+                            b.get("sessionId")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or_default(),
+                        )
+                });
+
+                let meta = build_response_meta(None, started_at);
+                print_result(&make_success_with_meta(
+                    command_name,
+                    json!({ "logs": logs }),
+                    meta,
+                ));
+            }
+            LogCommands::Tail { lines } => {
+                let started_at = Instant::now();
+                let command_name = "logs.tail";
+                let mut runtime =
+                    ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
+
+                if let Err(e) = begin_runtime_command(&mut runtime, command_name) {
+                    exit_with_error(command_name, e);
+                }
+
+                let log_path = runtime
+                    .ctx
+                    .base_dir
+                    .join("runtime")
+                    .join("logs")
+                    .join(format!("{}.ndjson", runtime.session.session_id));
+                let text = match std::fs::read_to_string(&log_path) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        let err = if e.kind() == std::io::ErrorKind::NotFound {
+                            CliError::bad_input(
+                                format!(
+                                    "No log file found for session {}",
+                                    runtime.session.session_id
+                                ),
+                                "Run commands for this session first, then retry logs tail",
+                            )
+                        } else {
+                            CliError::unknown(
+                                format!("Failed to read log file {}: {}", log_path.display(), e),
+                                "Check filesystem permissions",
+                            )
+                        };
+                        finish_runtime_command(
+                            &runtime,
+                            command_name,
+                            false,
+                            json!({ "message": err.message }),
+                        );
+                        exit_with_error(command_name, err);
+                    }
+                };
+
+                let limit = lines.max(1);
+                let all_lines: Vec<&str> = text.lines().collect();
+                let start = all_lines.len().saturating_sub(limit);
+                let items: Vec<_> = all_lines[start..]
+                    .iter()
+                    .map(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .unwrap_or_else(|_| json!({ "raw": line }))
+                    })
+                    .collect();
+
+                let meta = build_response_meta(Some(&runtime), started_at);
+                print_result(&make_success_with_meta(
+                    command_name,
+                    json!({
+                        "sessionId": runtime.session.session_id,
+                        "path": log_path.to_string_lossy(),
+                        "count": items.len(),
+                        "items": items
+                    }),
+                    meta,
+                ));
+                finish_runtime_command(
+                    &runtime,
+                    command_name,
+                    true,
+                    json!({ "count": items.len() }),
+                );
+            }
+        },
+
+        Commands::Console {
+            command: ConsoleCommands::Capture { duration_ms, level },
+        } => {
+            let command_name = "console.capture";
+            let mut runtime = ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
+            let level_filter: Option<Vec<String>> = level.map(|raw| {
+                raw.split(',')
+                    .map(|entry| entry.trim().to_ascii_lowercase())
+                    .filter(|entry| !entry.is_empty())
+                    .collect()
+            });
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let level_filter = level_filter.clone();
+                    async move {
+                        let mut entries = page
+                            .capture_console_for(Duration::from_millis(duration_ms))
+                            .await?;
+
+                        if let Some(levels) = level_filter {
+                            entries.retain(|entry| {
+                                levels
+                                    .iter()
+                                    .any(|level| level == &entry.level.to_ascii_lowercase())
+                            });
+                        }
+
+                        let mut by_level: std::collections::HashMap<String, usize> =
+                            std::collections::HashMap::new();
+                        for entry in &entries {
+                            *by_level.entry(entry.level.clone()).or_insert(0) += 1;
+                        }
+
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "durationMs": duration_ms,
+                                "count": entries.len(),
+                                "byLevel": by_level,
+                                "entries": entries
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+
+        Commands::Network {
+            command:
+                NetworkCommands::Capture {
+                    duration_ms,
+                    url_glob,
+                },
+        } => {
+            let command_name = "network.capture";
+            let mut runtime = ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
+            let matcher = match url_glob {
+                Some(pattern) => match wildcard_to_regex(&pattern) {
+                    Ok(regex) => Some(regex),
+                    Err(e) => exit_with_error(command_name, e),
+                },
+                None => None,
+            };
+
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let matcher = matcher.clone();
+                    async move {
+                        let mut entries = page
+                            .capture_network_for(Duration::from_millis(duration_ms))
+                            .await?;
+                        if let Some(regex) = matcher {
+                            entries.retain(|entry| regex.is_match(&entry.url));
+                        }
+
+                        let mut by_kind: std::collections::HashMap<String, usize> =
+                            std::collections::HashMap::new();
+                        for entry in &entries {
+                            *by_kind.entry(entry.kind.clone()).or_insert(0) += 1;
+                        }
+
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "durationMs": duration_ms,
+                                "count": entries.len(),
+                                "byKind": by_kind,
+                                "entries": entries
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+
+        Commands::Run {
+            file,
+            stop_on_error,
+        } => {
+            let started_at = Instant::now();
+            let command_name = "run";
+            let content = match std::fs::read_to_string(&file) {
+                Ok(content) => content,
+                Err(e) => {
+                    exit_with_error(
+                        command_name,
+                        CliError::unknown(
+                            format!("Failed to read workflow file {}: {}", file.display(), e),
+                            "Check file path and permissions",
+                        ),
+                    );
+                }
+            };
+            let workflow: WorkflowFile = match serde_json::from_str(&content) {
+                Ok(workflow) => workflow,
+                Err(e) => {
+                    exit_with_error(
+                        command_name,
+                        CliError::bad_input(
+                            format!("Workflow file is not valid JSON: {}", e),
+                            "Expected {\"steps\":[{\"command\":[\"runtime\",\"status\"]}]}",
+                        ),
+                    );
+                }
+            };
+            if workflow.steps.is_empty() {
+                exit_with_error(
+                    command_name,
+                    CliError::bad_input(
+                        "Workflow has no steps",
+                        "Provide at least one step in steps[]",
+                    ),
+                );
+            }
+
+            let exe = match std::env::current_exe() {
+                Ok(path) => path,
+                Err(e) => {
+                    exit_with_error(
+                        command_name,
+                        CliError::unknown(
+                            format!("Failed to resolve current executable: {}", e),
+                            "Run workflow steps manually",
+                        ),
+                    );
+                }
+            };
+
+            let mut steps_out: Vec<serde_json::Value> = Vec::new();
+            let mut failed_step: Option<usize> = None;
+            for (index, step) in workflow.steps.iter().enumerate() {
+                if step.command.is_empty() {
+                    steps_out.push(json!({
+                        "index": index,
+                        "name": step.name,
+                        "ok": false,
+                        "error": "step command is empty"
+                    }));
+                    failed_step = Some(index);
+                    if stop_on_error {
+                        break;
+                    }
+                    continue;
+                }
+
+                let output = match ProcessCommand::new(&exe).args(&step.command).output() {
+                    Ok(output) => output,
+                    Err(e) => {
+                        steps_out.push(json!({
+                            "index": index,
+                            "name": step.name,
+                            "ok": false,
+                            "argv": step.command,
+                            "error": format!("failed to execute step: {}", e)
+                        }));
+                        failed_step = Some(index);
+                        if stop_on_error {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
+                let parsed = stdout_text
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+                let ok = parsed
+                    .as_ref()
+                    .and_then(|value| value.get("result"))
+                    .and_then(|value| value.get("ok"))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or_else(|| output.status.success());
+
+                if !ok && failed_step.is_none() {
+                    failed_step = Some(index);
+                }
+
+                steps_out.push(json!({
+                    "index": index,
+                    "name": step.name,
+                    "argv": step.command,
+                    "ok": ok,
+                    "exitCode": output.status.code(),
+                    "result": parsed,
+                    "stderr": stderr_text
+                }));
+
+                if !ok && stop_on_error {
+                    break;
+                }
+            }
+
+            let overall_ok = failed_step.is_none();
+            let meta = build_response_meta(None, started_at);
+            if overall_ok {
+                print_result(&make_success_with_meta(
+                    command_name,
+                    json!({
+                        "file": file.to_string_lossy(),
+                        "stepsRun": steps_out.len(),
+                        "overallOk": overall_ok,
+                        "stopOnError": stop_on_error,
+                        "failedStep": failed_step,
+                        "steps": steps_out
+                    }),
+                    meta,
+                ));
+            } else {
+                let failed_index = failed_step.unwrap_or(0);
+                let failed_name = workflow
+                    .steps
+                    .get(failed_index)
+                    .and_then(|step| step.name.as_deref())
+                    .unwrap_or("unnamed");
+                let err = CliError::unknown(
+                    format!("Workflow failed at step {} ({})", failed_index, failed_name),
+                    "Inspect workflow step stderr output and fix the failing command",
+                );
+                print_result(&make_error_with_meta(command_name, &err, meta));
+                std::process::exit(err.exit_code);
+            }
+        }
+
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            let target_shell = match shell {
+                CompletionShell::Bash => Shell::Bash,
+                CompletionShell::Zsh => Shell::Zsh,
+            };
+            generate(target_shell, &mut cmd, bin_name, &mut std::io::stdout());
         }
     }
 }
@@ -2052,8 +3123,10 @@ async fn with_browser_command<F, Fut, T>(
     Fut: std::future::Future<Output = Result<types::ResultEnvelope<T>, CliError>>,
     T: Serialize,
 {
+    let started_at = Instant::now();
     if let Err(e) = begin_runtime_command(runtime, command_name) {
-        let res = make_error(command_name, &e);
+        let meta = build_response_meta(Some(runtime), started_at);
+        let res = make_error_with_meta(command_name, &e, meta);
         print_result(&res);
         std::process::exit(e.exit_code);
     }
@@ -2070,7 +3143,8 @@ async fn with_browser_command<F, Fut, T>(
                 false,
                 json!({ "errorCode": code, "message": e.message }),
             );
-            let res = make_error(command_name, &e);
+            let meta = build_response_meta(Some(runtime), started_at);
+            let res = make_error_with_meta(command_name, &e, meta);
             print_result(&res);
             std::process::exit(e.exit_code);
         }
@@ -2086,7 +3160,8 @@ async fn with_browser_command<F, Fut, T>(
                 false,
                 json!({ "errorCode": code, "message": e.message }),
             );
-            let res = make_error(command_name, &e);
+            let meta = build_response_meta(Some(runtime), started_at);
+            let res = make_error_with_meta(command_name, &e, meta);
             print_result(&res);
             std::process::exit(e.exit_code);
         }
@@ -2104,13 +3179,15 @@ async fn with_browser_command<F, Fut, T>(
             false,
             json!({ "errorCode": code, "message": e.message }),
         );
-        let res = make_error(command_name, &e);
+        let meta = build_response_meta(Some(runtime), started_at);
+        let res = make_error_with_meta(command_name, &e, meta);
         print_result(&res);
         std::process::exit(e.exit_code);
     }
 
     match f(page).await {
-        Ok(res) => {
+        Ok(mut res) => {
+            res.meta = build_response_meta(Some(runtime), started_at);
             print_result(&res);
             finish_runtime_command(runtime, command_name, true, json!({}));
         }
@@ -2122,7 +3199,8 @@ async fn with_browser_command<F, Fut, T>(
                 false,
                 json!({ "errorCode": code, "message": e.message }),
             );
-            let res = make_error(command_name, &e);
+            let meta = build_response_meta(Some(runtime), started_at);
+            let res = make_error_with_meta(command_name, &e, meta);
             print_result(&res);
             std::process::exit(e.exit_code);
         }
@@ -2139,8 +3217,10 @@ async fn with_browser_only_command<F, Fut, T>(
     Fut: std::future::Future<Output = Result<types::ResultEnvelope<T>, CliError>>,
     T: Serialize,
 {
+    let started_at = Instant::now();
     if let Err(e) = begin_runtime_command(runtime, command_name) {
-        let res = make_error(command_name, &e);
+        let meta = build_response_meta(Some(runtime), started_at);
+        let res = make_error_with_meta(command_name, &e, meta);
         print_result(&res);
         std::process::exit(e.exit_code);
     }
@@ -2157,14 +3237,16 @@ async fn with_browser_only_command<F, Fut, T>(
                 false,
                 json!({ "errorCode": code, "message": e.message }),
             );
-            let res = make_error(command_name, &e);
+            let meta = build_response_meta(Some(runtime), started_at);
+            let res = make_error_with_meta(command_name, &e, meta);
             print_result(&res);
             std::process::exit(e.exit_code);
         }
     };
 
     match f(browser).await {
-        Ok(res) => {
+        Ok(mut res) => {
+            res.meta = build_response_meta(Some(runtime), started_at);
             print_result(&res);
             finish_runtime_command(runtime, command_name, true, json!({}));
         }
@@ -2176,7 +3258,8 @@ async fn with_browser_only_command<F, Fut, T>(
                 false,
                 json!({ "errorCode": code, "message": e.message }),
             );
-            let res = make_error(command_name, &e);
+            let meta = build_response_meta(Some(runtime), started_at);
+            let res = make_error_with_meta(command_name, &e, meta);
             print_result(&res);
             std::process::exit(e.exit_code);
         }
@@ -2188,35 +3271,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cleanup_fallback_allows_missing_runtime() {
-        assert!(should_fallback_to_cleanup_without_runtime(
-            types::ErrorCode::SessionRequired,
-            false,
-        ));
-    }
-
-    #[test]
-    fn cleanup_fallback_allows_implicit_bad_input() {
-        assert!(should_fallback_to_cleanup_without_runtime(
-            types::ErrorCode::BadInput,
-            false,
-        ));
-    }
-
-    #[test]
-    fn cleanup_fallback_allows_implicit_invalid_session() {
-        assert!(should_fallback_to_cleanup_without_runtime(
-            types::ErrorCode::SessionInvalid,
-            false,
-        ));
-    }
-
-    #[test]
-    fn cleanup_fallback_rejects_explicit_bad_input() {
-        assert!(!should_fallback_to_cleanup_without_runtime(
-            types::ErrorCode::BadInput,
-            true,
-        ));
+    fn command_labels_are_namespaced() {
+        assert_eq!(
+            command_label(&Commands::Runtime {
+                command: RuntimeCommands::Status
+            }),
+            "runtime.status"
+        );
+        assert_eq!(
+            command_label(&Commands::Page {
+                command: PageCommands::Goto {
+                    url: "https://example.com".to_string(),
+                    until: "load".to_string(),
+                }
+            }),
+            "page.goto"
+        );
+        assert_eq!(
+            command_label(&Commands::Input {
+                command: InputCommands::Press {
+                    combo: "Enter".to_string(),
+                }
+            }),
+            "input.press"
+        );
+        assert_eq!(
+            command_label(&Commands::State {
+                command: StateCommands::List
+            }),
+            "state.list"
+        );
+        assert_eq!(
+            command_label(&Commands::Ref {
+                command: RefCommands::Validate { reference: None }
+            }),
+            "ref.validate"
+        );
+        assert_eq!(
+            command_label(&Commands::Logs {
+                command: LogCommands::Tail { lines: 5 }
+            }),
+            "logs.tail"
+        );
     }
 
     #[test]
