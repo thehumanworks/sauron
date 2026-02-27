@@ -11,7 +11,7 @@
 ## Current State
 
 - Command surface is namespaced (`runtime/page/input/tab/state/ref/logs/console/network/run`) in `src/main.rs`.
-- All commands return the v2 `v/meta/result` envelope.
+- All commands return the v2 `meta/result` envelope.
 - Runtime lifecycle commands are JSON-only (`runtime start/stop/status/cleanup`).
 - Selector-based input targeting and state/count-based waits are implemented.
 - Console and network capture commands are implemented for fixed durations.
@@ -62,7 +62,6 @@ All commands return:
 
 ```json
 {
-  "v": 2,
   "meta": {
     "requestId": "uuid",
     "timestamp": "RFC3339",
@@ -85,7 +84,6 @@ Error shape:
 
 ```json
 {
-  "v": 2,
   "meta": {
     "requestId": "uuid",
     "timestamp": "RFC3339",
@@ -128,6 +126,10 @@ Error shape:
 - `wait` -> `page wait`
 - `diff` -> `page diff`
 - `session *` -> `state *`
+
+## Related specs
+
+- [remove-response-version-key.md](remove-response-version-key.md): Removed `v` key from response envelope (versioning is pointless when there is no other version).
 
 ## Implementation Checklist (Completed)
 

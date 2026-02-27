@@ -198,7 +198,6 @@ All commands return exactly one JSON object in a unified v2 envelope:
 
 ```json
 {
-  "v": 2,
   "meta": { "requestId": "...", "timestamp": "...", "durationMs": 12 },
   "result": { "ok": true, "command": "page.snapshot", "data": { /* ... */ } }
 }
@@ -208,7 +207,6 @@ All commands return exactly one JSON object in a unified v2 envelope:
 
 ```json
 {
-  "v": 2,
   "meta": { "requestId": "...", "timestamp": "...", "durationMs": 9 },
   "result": {
     "ok": false,
