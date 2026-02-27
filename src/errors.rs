@@ -164,7 +164,6 @@ pub fn print_result<T: Serialize>(result: &ResultEnvelope<T>) {
         );
         serde_json::to_string(&fallback).unwrap_or_else(|_| {
             json!({
-                "v": 2,
                 "meta": {
                     "requestId": "internal",
                     "timestamp": Utc::now().to_rfc3339(),
@@ -201,7 +200,6 @@ mod tests {
             make_success_with_meta("page.goto", json!({ "url": "https://example.com" }), meta);
         let value = serde_json::to_value(result).expect("success envelope should serialize");
 
-        assert_eq!(value["v"], json!(2));
         assert_eq!(value["meta"]["requestId"], json!("req-1"));
         assert_eq!(value["result"]["ok"], json!(true));
         assert_eq!(value["result"]["command"], json!("page.goto"));
@@ -215,7 +213,6 @@ mod tests {
         let result = make_error_with_meta("page.wait", &error, meta);
         let value = serde_json::to_value(result).expect("error envelope should serialize");
 
-        assert_eq!(value["v"], json!(2));
         assert_eq!(value["result"]["ok"], json!(false));
         assert_eq!(value["result"]["command"], json!("page.wait"));
         assert_eq!(value["result"]["error"]["exitCode"], json!(1));

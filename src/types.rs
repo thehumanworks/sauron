@@ -23,8 +23,6 @@ impl Default for Viewport {
 // --- Output contract ---
 // Every browser command emits exactly one of these as JSON to stdout.
 
-pub const RESPONSE_ENVELOPE_VERSION: u8 = 2;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResponseMeta {
@@ -136,7 +134,6 @@ pub struct ResultEnvelope<T>
 where
     T: Serialize,
 {
-    pub v: u8,
     pub meta: ResponseMeta,
     pub result: EnvelopeResult<T>,
 }
@@ -147,7 +144,6 @@ where
 {
     pub fn success(command: impl Into<String>, data: T, meta: ResponseMeta) -> Self {
         Self {
-            v: RESPONSE_ENVELOPE_VERSION,
             meta,
             result: EnvelopeResult::Ok(CommandResult {
                 ok: true,
@@ -159,7 +155,6 @@ where
 
     pub fn error(command: impl Into<String>, error: ErrorEnvelope, meta: ResponseMeta) -> Self {
         Self {
-            v: RESPONSE_ENVELOPE_VERSION,
             meta,
             result: EnvelopeResult::Err(ErrorResult {
                 ok: false,
