@@ -51,6 +51,9 @@ Thumbs.db
 .env
 .env.*
 
+# Local dev
+specs/
+
 # Logs
 *.log
 
