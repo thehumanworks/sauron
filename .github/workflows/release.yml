@@ -1,0 +1,232 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          current_version="$(node scripts/release-version.mjs current)"
+          latest_tag="$(git tag --list 'v*' --sort=-version:refname | head -n1 | sed 's/^v//')"
+
+          if [[ -n "${latest_tag}" ]]; then
+            next_version="$(node scripts/release-version.mjs next-patch "${current_version}" "${latest_tag}")"
+          else
+            next_version="$(node scripts/release-version.mjs next-patch "${current_version}")"
+          fi
+
+          echo "version=${next_version}" >> "${GITHUB_OUTPUT}"
+
+      - id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix_json="$(node -e "const config=require('./distribution/targets.json'); process.stdout.write(JSON.stringify({include: config.targets.map((target) => ({runner: target.runner, target: target.triple}))}))")"
+          echo "matrix=${matrix_json}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Sync release version
+        run: node scripts/release-version.mjs set "${RELEASE_VERSION}"
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}"
+          mkdir -p "dist/${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/sauron" "dist/${{ matrix.target }}/sauron"
+          chmod 0755 "dist/${{ matrix.target }}/sauron"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ matrix.target }}/sauron
+          if-no-files-found: error
+
+  validate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Sync release version
+        run: node scripts/release-version.mjs set "${RELEASE_VERSION}"
+
+      - name: Run test suite
+        run: cargo test --locked
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Verify release build
+        run: cargo build --release --locked
+
+  publish:
+    needs:
+      - prepare
+      - build
+      - validate
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      PACKAGE_NAME: '@nothumanwork/sauron'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@nothumanwork'
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/release-artifacts
+
+      - name: Ensure release still matches main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --depth=1
+          remote_head="$(git rev-parse origin/main)"
+          if [[ "${remote_head}" != "${GITHUB_SHA}" ]]; then
+            printf 'main advanced to %s while preparing %s; cancelling stale release\n' "${remote_head}" "${GITHUB_SHA}" >&2
+            exit 1
+          fi
+
+      - name: Sync release version
+        run: node scripts/release-version.mjs set "${RELEASE_VERSION}"
+
+      - name: Stage npm binaries
+        run: node scripts/stage-npm-binaries.mjs dist/release-artifacts npm/bin
+
+      - name: Verify npm package contents
+        run: npm pack --dry-run
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release-bundles
+
+          while IFS= read -r target; do
+            tar -C "dist/release-artifacts/${target}" \
+              -czf "dist/release-bundles/sauron-v${RELEASE_VERSION}-${target}.tar.gz" \
+              sauron
+          done < <(node -e "const config=require('./distribution/targets.json'); for (const target of config.targets) console.log(target.triple)")
+
+      - name: Publish npm package when missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npm view "${PACKAGE_NAME}@${RELEASE_VERSION}" version --json >/dev/null 2>&1; then
+            echo "${PACKAGE_NAME}@${RELEASE_VERSION} already exists on npm; skipping publish"
+          else
+            npm publish --access public
+          fi
+
+      - name: Commit version bump and push tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --depth=1 --tags
+          remote_head="$(git rev-parse origin/main)"
+          if [[ "${remote_head}" != "${GITHUB_SHA}" ]]; then
+            printf 'main advanced to %s after publish for %s; refusing to push stale version commit\n' "${remote_head}" "${GITHUB_SHA}" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Cargo.toml Cargo.lock package.json
+          staged_files="$(git diff --cached --name-only | sort)"
+          printf '%s\n' "${staged_files}"
+
+          expected_files=$'Cargo.lock\nCargo.toml\npackage.json'
+          if [[ "${staged_files}" != "${expected_files}" ]]; then
+            printf 'unexpected staged files:\n%s\n' "${staged_files}" >&2
+            exit 1
+          fi
+
+          git commit \
+            -m "release: v${RELEASE_VERSION}" \
+            -m "Co-authored-by: Codex <noreply@openai.com>"
+          git tag -a "v${RELEASE_VERSION}" -m "v${RELEASE_VERSION}"
+          git push origin HEAD:main
+          git push origin "v${RELEASE_VERSION}"
+
+      - name: Create or update GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "v${RELEASE_VERSION}" >/dev/null 2>&1; then
+            gh release upload "v${RELEASE_VERSION}" dist/release-bundles/* --clobber
+          else
+            gh release create "v${RELEASE_VERSION}" dist/release-bundles/* --title "v${RELEASE_VERSION}" --notes "Automated release for ${GITHUB_SHA}."
+          fi

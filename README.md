@@ -57,6 +57,19 @@ Or run in place:
 cargo run -- --help
 ```
 
+Or install the published npm package:
+
+```bash
+npm install -g @nothumanwork/sauron
+```
+
+The npm package bundles prebuilt binaries for:
+- `x86_64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+The `sauron` launcher inside the package selects the matching binary for the current host OS and architecture at runtime.
+
 ## Quick start
 
 Each shell/process must start a runtime session first:
@@ -227,3 +240,15 @@ All commands return exactly one JSON object in a unified v2 envelope:
 
 - You need a local Chrome/Chromium install.
 - The daemon uses `--remote-debugging-port=<port>`.
+
+## Automated Releases
+
+Pushes to `main` cut the next patch version automatically. GitHub Actions then:
+
+- builds the release binaries on GitHub-hosted Linux and macOS runners,
+- stages them into the scoped npm package `@nothumanwork/sauron`,
+- publishes the npm package,
+- tags the repository with `v<version>`, and
+- creates the matching GitHub release with per-target tarballs.
+
+The release version is kept in sync across `Cargo.toml`, `Cargo.lock`, and `package.json`.

@@ -1,0 +1,43 @@
+{
+  "name": "@nothumanwork/sauron",
+  "version": "0.2.0",
+  "description": "Rust-native CLI for controlling Chrome via CDP",
+  "license": "MIT",
+  "homepage": "https://github.com/thehumanworks/sauron#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thehumanworks/sauron.git"
+  },
+  "bugs": {
+    "url": "https://github.com/thehumanworks/sauron/issues"
+  },
+  "bin": {
+    "sauron": "./bin/sauron.js"
+  },
+  "files": [
+    "bin/",
+    "distribution/targets.json",
+    "npm/bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "release:current": "node ./scripts/release-version.mjs current",
+    "release:next-patch": "node ./scripts/release-version.mjs next-patch",
+    "release:set-version": "node ./scripts/release-version.mjs set",
+    "stage:binaries": "node ./scripts/stage-npm-binaries.mjs",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "keywords": [
+    "chrome",
+    "cdp",
+    "cli",
+    "automation",
+    "rust"
+  ]
+}

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 Core code lives in `src/`. Entry point and CLI routing are in `src/main.rs`. Runtime/session lifecycle and backend storage are in `src/runtime.rs` (filesystem runtime store). Chrome process control is in `src/daemon.rs`, CDP transport in `src/cdp.rs`, and browser actions in `src/browser.rs`. Shared command/result types and errors are in `src/types.rs` and `src/errors.rs`.  
-User-facing docs are in `README.md`. Build config is in `Cargo.toml`.
+User-facing docs are in `README.md`. Build config is in `Cargo.toml`. npm distribution metadata lives in `package.json`, `distribution/targets.json`, and `bin/sauron.js`. GitHub release automation lives in `.github/workflows/release.yml`.
 
 ## Interaction & Data Flow Diagrams
 
@@ -42,6 +42,8 @@ flowchart LR
 - `cargo test`: run unit tests (`#[cfg(test)]` modules).
 - `cargo clippy --all-targets --all-features -- -D warnings`: enforce lint-clean code.
 - `cargo build --release`: produce optimized binary used for final verification.
+- `node scripts/release-version.mjs current`: confirm Cargo/npm release versions are synchronized.
+- `npm pack --dry-run`: validate the scoped npm package after staging binaries into `npm/bin/`.
 
 Use the full gate sequence before submitting changes: test, clippy, release build.
 
