@@ -18,8 +18,6 @@
 **/*.exe
 
 # Rust dependency and tool artifacts
-/Cargo.lock
-**/Cargo.lock
 /coverage/
 *.profraw
 *.profdata
