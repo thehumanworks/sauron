@@ -1134,32 +1134,25 @@ impl PageClient {
         }
     }
 
-    /// Extract the full text content of the page as Markdown.
+    /// Extract the visible page content as Markdown.
     ///
     /// Notes:
-    /// - This favors completeness over perfect Markdown structure.
-    /// - It uses `document.body.innerText`, which generally matches what a user would copy/paste.
+    /// - This uses a DOM-aware page-side extractor so headings and list-like card grids are
+    ///   preserved instead of flattened into `innerText`.
+    /// - Decorative chrome such as nav/aside regions and aria-hidden shimmer text is skipped.
     pub async fn extract_markdown(&self) -> Result<String, CliError> {
-        let expr = r##"(() => {
-  const title = (document.title || "").trim();
-  const url = (location && location.href) ? String(location.href) : "";
-  const body = (document.body && document.body.innerText) ? document.body.innerText.trim() : "";
-  let out = "";
-  if (title) out += "# " + title + "
-
-";
-  if (url) out += "_Source_: " + url + "
-
-";
-  out += body;
-  return out;
-})()"##;
-
-        let v = self.eval(expr).await?;
-        match v {
-            Value::String(s) => Ok(s),
-            other => Ok(other.to_string()),
+        let v = self.eval(markdown_extract_expression()).await?;
+        if let Value::String(s) = v {
+            return Ok(s);
         }
+
+        let payload = serde_json::from_value::<MarkdownExtractPayload>(v).map_err(|e| {
+            CliError::unknown(
+                format!("Unexpected markdown extraction payload: {}", e),
+                "Retry after the page finishes rendering",
+            )
+        })?;
+        Ok(render_markdown_payload(&payload))
     }
 
     pub async fn wait_for_text(&self, text: &str, timeout: Duration) -> Result<(), CliError> {
@@ -1626,6 +1619,172 @@ impl PageClient {
 
         Ok(((min_x + max_x) / 2.0, (min_y + max_y) / 2.0))
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct MarkdownExtractPayload {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    fallback_text: String,
+    #[serde(default)]
+    blocks: Vec<MarkdownBlock>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MarkdownBlock {
+    Heading { level: u8, text: String },
+    Paragraph { text: String },
+    OrderedList { items: Vec<MarkdownListItem> },
+    UnorderedList { items: Vec<MarkdownListItem> },
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct MarkdownListItem {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    meta: String,
+    #[serde(default)]
+    body: String,
+}
+
+fn render_markdown_payload(payload: &MarkdownExtractPayload) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    let title = collapse_markdown_text(&payload.title);
+    if !title.is_empty() {
+        sections.push(format!("# {}", title));
+    }
+
+    let url = payload.url.trim();
+    if !url.is_empty() {
+        sections.push(format!("_Source_: {}", url));
+    }
+
+    let body = render_markdown_body(payload);
+    if !body.is_empty() {
+        sections.push(body);
+    }
+
+    sections.join("\n\n")
+}
+
+fn render_markdown_body(payload: &MarkdownExtractPayload) -> String {
+    let blocks = payload
+        .blocks
+        .iter()
+        .filter_map(render_markdown_block)
+        .collect::<Vec<_>>();
+    if !blocks.is_empty() {
+        return blocks.join("\n\n");
+    }
+
+    let fallback = preserve_markdown_lines(&payload.fallback_text);
+    if fallback.is_empty() {
+        String::new()
+    } else {
+        fallback.replace('\n', "  \n")
+    }
+}
+
+fn render_markdown_block(block: &MarkdownBlock) -> Option<String> {
+    match block {
+        MarkdownBlock::Heading { level, text } => {
+            let text = collapse_markdown_text(text);
+            if text.is_empty() {
+                None
+            } else {
+                let depth = (*level).clamp(1, 6);
+                Some(format!("{} {}", "#".repeat(depth as usize), text))
+            }
+        }
+        MarkdownBlock::Paragraph { text } => {
+            let text = preserve_markdown_lines(text);
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.replace('\n', "  \n"))
+            }
+        }
+        MarkdownBlock::OrderedList { items } => render_markdown_list(items, true),
+        MarkdownBlock::UnorderedList { items } => render_markdown_list(items, false),
+    }
+}
+
+fn render_markdown_list(items: &[MarkdownListItem], ordered: bool) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    for (idx, item) in items.iter().enumerate() {
+        let head = render_markdown_list_head(item);
+        let body = preserve_markdown_lines(&item.body);
+        if head.is_empty() && body.is_empty() {
+            continue;
+        }
+
+        let marker = if ordered {
+            format!("{}.", idx + 1)
+        } else {
+            "-".to_string()
+        };
+
+        if head.is_empty() {
+            let mut body_lines = body.lines();
+            if let Some(first) = body_lines.next() {
+                lines.push(format!("{} {}", marker, first));
+                for line in body_lines {
+                    lines.push(format!("   {}", line));
+                }
+            }
+            continue;
+        }
+
+        lines.push(format!("{} {}", marker, head));
+        if !body.is_empty() {
+            for line in body.lines() {
+                lines.push(format!("   {}", line));
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn render_markdown_list_head(item: &MarkdownListItem) -> String {
+    let title = collapse_markdown_text(&item.title);
+    let meta = collapse_markdown_text(&item.meta);
+
+    match (title.is_empty(), meta.is_empty()) {
+        (false, false) => format!("**{}** ({})", title, meta),
+        (false, true) => format!("**{}**", title),
+        (true, false) => meta,
+        (true, true) => String::new(),
+    }
+}
+
+fn collapse_markdown_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn preserve_markdown_lines(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2720,5 +2879,353 @@ fn key_to_cdp(token: &str) -> KeyInfo {
         code: t.to_string(),
         vk: 0,
         text: "".to_string(),
+    }
+}
+
+fn markdown_extract_expression() -> &'static str {
+    r##"(() => {
+  const title = (document.title || "").trim();
+  const url = (location && location.href) ? String(location.href) : "";
+  const fallbackText = (document.body && document.body.innerText) ? document.body.innerText.trim() : "";
+
+  const HEADING_LEVELS = { h1: 1, h2: 2, h3: 3, h4: 4, h5: 5, h6: 6 };
+  const IGNORED_TAGS = new Set([
+    "script",
+    "style",
+    "template",
+    "noscript",
+    "svg",
+    "canvas"
+  ]);
+
+  const isElement = (node) => !!node && node.nodeType === Node.ELEMENT_NODE;
+
+  const tagName = (el) => (isElement(el) ? el.tagName.toLowerCase() : "");
+
+  const normalizeText = (value, preserveLines = false) => {
+    const text = String(value || "").replace(/\u00a0/g, " ");
+    if (preserveLines) {
+      return text
+        .split(/\r?\n+/)
+        .map((line) => line.replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+        .join("\n");
+    }
+    return text.replace(/\s+/g, " ").trim();
+  };
+
+  const isHidden = (el) => {
+    if (!isElement(el)) return true;
+    if (el.hidden) return true;
+    if (el.getAttribute("aria-hidden") === "true") return true;
+    const style = window.getComputedStyle(el);
+    if (!style) return false;
+    return (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse"
+    );
+  };
+
+  const isIgnoredElement = (el) => {
+    if (!isElement(el)) return true;
+    const tag = tagName(el);
+    return IGNORED_TAGS.has(tag) || tag === "nav" || tag === "aside" || isHidden(el);
+  };
+
+  const elementText = (el, preserveLines = false) =>
+    normalizeText(isElement(el) ? el.innerText : "", preserveLines);
+
+  const hasMeaningfulText = (el) => elementText(el, true) !== "";
+
+  const visibleChildren = (el) =>
+    Array.from(el.children || []).filter(
+      (child) => !isIgnoredElement(child) && hasMeaningfulText(child)
+    );
+
+  const visibleMatches = (root, selector) =>
+    Array.from(root.querySelectorAll(selector))
+      .filter((el) => !isIgnoredElement(el))
+      .map((el) => elementText(el, true))
+      .filter(Boolean);
+
+  const cardLines = (el) => elementText(el, true).split("\n").filter(Boolean);
+
+  const headingElements = (el) =>
+    Array.from(el.querySelectorAll("h1,h2,h3,h4,h5,h6")).filter(
+      (node) => !isIgnoredElement(node) && elementText(node)
+    );
+
+  const extractSequentialCard = (el) => {
+    const children = visibleChildren(el);
+    if (children.length < 2) return null;
+
+    const numberText = elementText(children[0]);
+    if (!/^\d+$/.test(numberText)) return null;
+
+    const number = Number.parseInt(numberText, 10);
+    const headings = headingElements(el);
+    if (headings.length !== 1) return null;
+    const heading = headings[0];
+    const title = heading ? elementText(heading) : "";
+    if (!title) return null;
+
+    const lines = cardLines(el);
+    if (lines.length < 2 || lines.length > 4) return null;
+    const titleIndex = lines.findIndex((line) => line === title);
+    let body = titleIndex >= 0 ? lines.slice(titleIndex + 1).join(" ") : "";
+    if (!body) {
+      const paragraphs = visibleMatches(el, "p").filter(
+        (text) => text !== title && text !== numberText
+      );
+      body = paragraphs.at(-1) || "";
+    }
+
+    return { number, title, body };
+  };
+
+  const extractFactCard = (el) => {
+    const lines = cardLines(el);
+    if (lines.length < 2 || lines.length > 4) return null;
+    if (!/^\d+(?:\+)?$/.test(lines[0])) return null;
+    return {
+      title: lines[1] || "",
+      meta: lines[0],
+      body: lines.slice(2).join(" ")
+    };
+  };
+
+  const extractInfoCard = (el) => {
+    const headings = headingElements(el);
+    if (headings.length !== 1) return null;
+    const titleEl = headings[0];
+
+    const title = elementText(titleEl);
+    if (!title) return null;
+
+    const lines = cardLines(el);
+    if (lines.length < 2 || lines.length > 4) return null;
+    const titleIndex = lines.findIndex((line) => line === title);
+    if (titleIndex < 0) return null;
+
+    const meta = lines.slice(0, titleIndex).join(" ");
+    const body = lines.slice(titleIndex + 1).join(" ");
+    if (!meta && !body) return null;
+
+    return { title, meta, body };
+  };
+
+  const renderSemanticList = (el, ordered) => {
+    const items = Array.from(el.children || [])
+      .filter((child) => tagName(child) === "li" && !isIgnoredElement(child))
+      .map((child) => ({ body: elementText(child, true) }))
+      .filter((item) => item.body);
+
+    if (!items.length) return null;
+    return { kind: ordered ? "ordered_list" : "unordered_list", items };
+  };
+
+  const renderSequentialGroup = (el) => {
+    const children = visibleChildren(el);
+    if (children.length < 2) return null;
+    const items = children.map(extractSequentialCard);
+    if (items.some((item) => !item)) return null;
+    if (!items.every((item, index) => item.number === index + 1)) return null;
+
+    return {
+      kind: "ordered_list",
+      items: items.map((item) => ({ title: item.title, body: item.body }))
+    };
+  };
+
+  const renderFactGroup = (el) => {
+    const children = visibleChildren(el);
+    if (children.length < 2) return null;
+    const items = children.map(extractFactCard);
+    if (items.some((item) => !item)) return null;
+
+    const sequential = items.every((item, index) => Number.parseInt(item.meta, 10) === index + 1);
+    if (sequential) return null;
+
+    return { kind: "unordered_list", items };
+  };
+
+  const renderInfoGroup = (el) => {
+    const children = visibleChildren(el);
+    if (children.length < 2) return null;
+    const items = children.map(extractInfoCard);
+    if (items.some((item) => !item)) return null;
+    return { kind: "unordered_list", items };
+  };
+
+  const renderStructuredGroup = (el) =>
+    renderSequentialGroup(el) || renderFactGroup(el) || renderInfoGroup(el);
+
+  const pushParagraph = (blocks, text) => {
+    const normalized = normalizeText(text, true);
+    if (normalized) {
+      blocks.push({ kind: "paragraph", text: normalized });
+    }
+  };
+
+  const walk = (node, blocks) => {
+    if (!isElement(node) || isIgnoredElement(node)) return;
+
+    const tag = tagName(node);
+    if (tag in HEADING_LEVELS) {
+      const text = elementText(node, true);
+      if (text) {
+        blocks.push({ kind: "heading", level: HEADING_LEVELS[tag], text });
+      }
+      return;
+    }
+
+    if (tag === "p") {
+      pushParagraph(blocks, elementText(node, true));
+      return;
+    }
+
+    if (tag === "ul") {
+      const block = renderSemanticList(node, false);
+      if (block) blocks.push(block);
+      return;
+    }
+
+    if (tag === "ol") {
+      const block = renderSemanticList(node, true);
+      if (block) blocks.push(block);
+      return;
+    }
+
+    if (tag === "li") {
+      pushParagraph(blocks, elementText(node, true));
+      return;
+    }
+
+    const structured = renderStructuredGroup(node);
+    if (structured) {
+      blocks.push(structured);
+      return;
+    }
+
+    const children = visibleChildren(node);
+    if (!children.length) {
+      const text = elementText(node, true);
+      if (text && tag !== "img" && tag !== "body") {
+        pushParagraph(blocks, text);
+      }
+      return;
+    }
+
+    for (const child of children) {
+      walk(child, blocks);
+    }
+  };
+
+  const blocks = [];
+  const roots = Array.from(document.querySelectorAll("main"))
+    .filter((root) => !isIgnoredElement(root) && hasMeaningfulText(root));
+  const startNodes = roots.length ? roots : visibleChildren(document.body || document.documentElement);
+  for (const root of startNodes) {
+    walk(root, blocks);
+  }
+
+  return { title, url, fallbackText, blocks };
+})()"##
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        markdown_extract_expression, render_markdown_payload, MarkdownBlock,
+        MarkdownExtractPayload, MarkdownListItem,
+    };
+
+    #[test]
+    fn render_markdown_payload_preserves_heading_spacing() {
+        let payload = MarkdownExtractPayload {
+            title: "Create Next App".to_string(),
+            url: "http://localhost:3000/about".to_string(),
+            fallback_text: String::new(),
+            blocks: vec![
+                MarkdownBlock::Heading {
+                    level: 2,
+                    text: "Services".to_string(),
+                },
+                MarkdownBlock::Paragraph {
+                    text: "Daycare by Melissa Harding".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            render_markdown_payload(&payload),
+            "# Create Next App\n\n_Source_: http://localhost:3000/about\n\n## Services\n\nDaycare by Melissa Harding"
+        );
+    }
+
+    #[test]
+    fn render_markdown_payload_formats_ordered_cards_inline() {
+        let payload = MarkdownExtractPayload {
+            title: String::new(),
+            url: String::new(),
+            fallback_text: String::new(),
+            blocks: vec![MarkdownBlock::OrderedList {
+                items: vec![
+                    MarkdownListItem {
+                        title: "Get in Touch".to_string(),
+                        meta: String::new(),
+                        body: "Send us an enquiry with your dog's details.".to_string(),
+                    },
+                    MarkdownListItem {
+                        title: "Meet & Greet".to_string(),
+                        meta: String::new(),
+                        body: "A mandatory in-person meeting.".to_string(),
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            render_markdown_payload(&payload),
+            "1. **Get in Touch**\n   Send us an enquiry with your dog's details.\n2. **Meet & Greet**\n   A mandatory in-person meeting."
+        );
+    }
+
+    #[test]
+    fn render_markdown_payload_formats_unordered_cards_with_meta() {
+        let payload = MarkdownExtractPayload {
+            title: String::new(),
+            url: String::new(),
+            fallback_text: String::new(),
+            blocks: vec![MarkdownBlock::UnorderedList {
+                items: vec![
+                    MarkdownListItem {
+                        title: "Daycare".to_string(),
+                        meta: "7:45 AM – 6:00 PM".to_string(),
+                        body: "Full-day care in a home environment.".to_string(),
+                    },
+                    MarkdownListItem {
+                        title: "Maximum dogs".to_string(),
+                        meta: "4".to_string(),
+                        body: "Quality over quantity — always".to_string(),
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            render_markdown_payload(&payload),
+            "- **Daycare** (7:45 AM – 6:00 PM)\n   Full-day care in a home environment.\n- **Maximum dogs** (4)\n   Quality over quantity — always"
+        );
+    }
+
+    #[test]
+    fn markdown_expression_returns_structured_blocks() {
+        let expr = markdown_extract_expression();
+
+        assert!(expr.contains("kind: \"ordered_list\""));
+        assert!(expr.contains("kind: \"unordered_list\""));
+        assert!(expr.contains("fallbackText"));
     }
 }
