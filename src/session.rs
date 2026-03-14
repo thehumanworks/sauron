@@ -18,6 +18,9 @@ pub struct SessionData {
     pub cookies: Vec<Value>,
     /// origin -> (key -> value)
     pub local_storage: HashMap<String, HashMap<String, String>>,
+    /// origin -> (key -> value)
+    #[serde(default)]
+    pub session_storage: HashMap<String, HashMap<String, String>>,
 }
 
 fn validate_session_name(name: &str) -> Result<(), CliError> {
@@ -92,6 +95,28 @@ pub async fn save_session(
     let mut local_storage: HashMap<String, HashMap<String, String>> = HashMap::new();
     local_storage.insert(origin.clone(), local);
 
+    // sessionStorage
+    let session_storage_val = page
+        .eval(
+            "(() => { const o = {}; for (let i = 0; i < window.sessionStorage.length; i++) { const k = window.sessionStorage.key(i); o[k] = window.sessionStorage.getItem(k); } return o; })()",
+        )
+        .await
+        .unwrap_or(Value::Object(serde_json::Map::new()));
+    let mut session: HashMap<String, String> = HashMap::new();
+    if let Some(obj) = session_storage_val.as_object() {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                session.insert(k.clone(), s.to_string());
+            } else if v.is_null() {
+                session.insert(k.clone(), "".to_string());
+            } else {
+                session.insert(k.clone(), v.to_string());
+            }
+        }
+    }
+    let mut session_storage: HashMap<String, HashMap<String, String>> = HashMap::new();
+    session_storage.insert(origin.clone(), session);
+
     let data = SessionData {
         version: 1,
         name: name.to_string(),
@@ -99,6 +124,7 @@ pub async fn save_session(
         url: current_url,
         cookies,
         local_storage,
+        session_storage,
     };
 
     let path = sessions_dir(ctx).join(format!("{}.json", name));
@@ -167,6 +193,18 @@ pub async fn load_session(
         let _ = page.eval(&expr).await;
     }
 
+    for (origin, storage) in &data.session_storage {
+        if origin != &current_origin {
+            continue;
+        }
+        let json_entries = serde_json::to_string(storage).unwrap_or_else(|_| "{}".to_string());
+        let expr = format!(
+            "(() => {{ const entries = {}; for (const [k,v] of Object.entries(entries)) {{ window.sessionStorage.setItem(k, v); }} }})()",
+            json_entries
+        );
+        let _ = page.eval(&expr).await;
+    }
+
     Ok(data)
 }
 
@@ -200,6 +238,8 @@ pub async fn list_sessions(ctx: &AppContext) -> Result<Vec<SessionSummary>, CliE
                     saved_at: data.saved_at,
                     url: data.url,
                     cookie_count: data.cookies.len() as u64,
+                    local_storage_origins: data.local_storage.len() as u64,
+                    session_storage_origins: data.session_storage.len() as u64,
                 });
             }
         }
@@ -215,6 +255,8 @@ pub struct SessionSummary {
     pub saved_at: String,
     pub url: String,
     pub cookie_count: u64,
+    pub local_storage_origins: u64,
+    pub session_storage_origins: u64,
 }
 
 pub async fn delete_session(ctx: &AppContext, name: &str) -> Result<bool, CliError> {
@@ -232,5 +274,173 @@ pub async fn delete_session(ctx: &AppContext, name: &str) -> Result<bool, CliErr
                 ))
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMetadata {
+    pub name: String,
+    pub version: u32,
+    pub saved_at: String,
+    pub url: String,
+    pub cookie_count: u64,
+    pub local_storage_origins: u64,
+    pub session_storage_origins: u64,
+}
+
+pub async fn show_session(ctx: &AppContext, name: &str) -> Result<SessionMetadata, CliError> {
+    validate_session_name(name)?;
+    let path = sessions_dir(ctx).join(format!("{}.json", name));
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CliError::bad_input(
+                format!("Session not found: {}", name),
+                "Use 'sauron state list' to see available sessions",
+            )
+        } else {
+            CliError::unknown(
+                format!("Failed to read session file: {}", e),
+                "Check filesystem permissions",
+            )
+        }
+    })?;
+    let data: SessionData = serde_json::from_str(&text).map_err(|e| {
+        CliError::unknown(
+            format!("Failed to parse session JSON: {}", e),
+            "The session file may be corrupted",
+        )
+    })?;
+
+    Ok(SessionMetadata {
+        name: data.name,
+        version: data.version,
+        saved_at: data.saved_at,
+        url: data.url,
+        cookie_count: data.cookies.len() as u64,
+        local_storage_origins: data.local_storage.len() as u64,
+        session_storage_origins: data.session_storage.len() as u64,
+    })
+}
+
+pub async fn rename_session(ctx: &AppContext, from: &str, to: &str) -> Result<bool, CliError> {
+    validate_session_name(from)?;
+    validate_session_name(to)?;
+    let from_path = sessions_dir(ctx).join(format!("{}.json", from));
+    let to_path = sessions_dir(ctx).join(format!("{}.json", to));
+
+    if to_path.exists() {
+        return Err(CliError::bad_input(
+            format!("Session '{}' already exists", to),
+            "Choose a different destination name",
+        ));
+    }
+
+    match std::fs::rename(&from_path, &to_path) {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(CliError::unknown(
+                    format!("Failed to rename session: {}", e),
+                    "Check filesystem permissions",
+                ))
+            }
+        }
+    }
+}
+
+pub async fn clear_sessions(ctx: &AppContext) -> Result<u64, CliError> {
+    let dir = sessions_dir(ctx);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(0);
+            }
+            return Err(CliError::unknown(
+                format!("Failed to read sessions dir: {}", e),
+                "Check filesystem permissions",
+            ));
+        }
+    };
+
+    let mut removed = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(_) => removed += 1,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(CliError::unknown(
+                        format!("Failed to remove {}: {}", path.display(), e),
+                        "Check filesystem permissions",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+pub async fn clean_sessions(ctx: &AppContext) -> Result<u64, CliError> {
+    let dir = sessions_dir(ctx);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(0);
+            }
+            return Err(CliError::unknown(
+                format!("Failed to read sessions dir: {}", e),
+                "Check filesystem permissions",
+            ));
+        }
+    };
+
+    let mut removed = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                removed += 1;
+                continue;
+            }
+        };
+        if serde_json::from_str::<SessionData>(&text).is_err() {
+            let _ = std::fs::remove_file(&path);
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_data_deserializes_without_session_storage_field() {
+        let raw = r#"{
+            "version": 1,
+            "name": "legacy",
+            "savedAt": "2026-01-01T00:00:00Z",
+            "url": "https://example.com",
+            "cookies": [],
+            "localStorage": {}
+        }"#;
+        let parsed: SessionData =
+            serde_json::from_str(raw).expect("legacy session json should deserialize");
+        assert!(parsed.session_storage.is_empty());
     }
 }

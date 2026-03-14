@@ -89,6 +89,13 @@ pub struct RetryHint {
     pub requires: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryHint {
+    pub action: String,
+    pub steps: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandResult<T>
 where
@@ -110,6 +117,8 @@ pub struct ErrorEnvelope {
     pub category: ErrorCategory,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryHint>,
 }
 
 #[derive(Debug, Clone, Serialize)]

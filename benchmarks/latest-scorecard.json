@@ -1,0 +1,12 @@
+{
+  "generatedAt": "2026-03-14T21:22:07Z",
+  "runs": [
+    {"label":"sauron_open","ok":true,"status":0,"runs":3,"avgMs":242},
+    {"label":"sauron_snapshot","ok":true,"status":0,"runs":3,"avgMs":94},
+    {"label":"sauron_get_title","ok":true,"status":0,"runs":3,"avgMs":74},
+    {"label":"sauron_wait_networkidle","ok":true,"status":0,"runs":3,"avgMs":690},
+    {"label":"agent_browser_open","ok":true,"status":0,"runs":3,"avgMs":269},
+    {"label":"agent_browser_snapshot","ok":true,"status":0,"runs":3,"avgMs":229},
+    {"label":"agent_browser_wait","ok":true,"status":0,"runs":3,"avgMs":1025}
+  ]
+}

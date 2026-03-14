@@ -1,5 +1,6 @@
 use crate::types::{
-    ErrorCategory, ErrorCode, ErrorEnvelope, ResponseMeta, ResultEnvelope, RetryHint, RetryStrategy,
+    ErrorCategory, ErrorCode, ErrorEnvelope, RecoveryHint, ResponseMeta, ResultEnvelope, RetryHint,
+    RetryStrategy,
 };
 use chrono::Utc;
 use serde::Serialize;
@@ -15,6 +16,7 @@ pub struct CliError {
     pub exit_code: i32,
     pub category: ErrorCategory,
     pub retry: Option<RetryHint>,
+    pub recovery: Option<RecoveryHint>,
 }
 
 impl CliError {
@@ -33,6 +35,7 @@ impl CliError {
             exit_code,
             category: default_error_category(code),
             retry: default_retry_hint(code, recoverable),
+            recovery: default_recovery_hint(code),
         }
     }
 
@@ -74,6 +77,7 @@ impl CliError {
             exit_code: self.exit_code,
             category: self.category,
             retry: self.retry.clone(),
+            recovery: self.recovery.clone(),
         }
     }
 }
@@ -125,6 +129,49 @@ fn default_retry_hint(code: ErrorCode, recoverable: bool) -> Option<RetryHint> {
         strategy,
         requires,
     })
+}
+
+fn default_recovery_hint(code: ErrorCode) -> Option<RecoveryHint> {
+    let hint = match code {
+        ErrorCode::RefStale => RecoveryHint {
+            action: "resnapshot".to_string(),
+            steps: vec![
+                "Run snapshot to refresh refs".to_string(),
+                "Re-resolve target with the new ref id".to_string(),
+            ],
+        },
+        ErrorCode::SessionRequired | ErrorCode::SessionInvalid | ErrorCode::SessionTerminated => {
+            RecoveryHint {
+                action: "reacquire-session".to_string(),
+                steps: vec![
+                    "Start or auto-ensure a runtime session".to_string(),
+                    "Retry the command with --session when needed".to_string(),
+                ],
+            }
+        }
+        ErrorCode::NavTimeout | ErrorCode::WaitTimeout | ErrorCode::Timeout => RecoveryHint {
+            action: "retry-after-delay".to_string(),
+            steps: vec![
+                "Wait for page/network to settle".to_string(),
+                "Retry with a longer timeout".to_string(),
+            ],
+        },
+        ErrorCode::DaemonDown | ErrorCode::ChromeCrashed => RecoveryHint {
+            action: "reopen-page".to_string(),
+            steps: vec![
+                "Start runtime to reconnect to browser".to_string(),
+                "Retry navigation and target resolution".to_string(),
+            ],
+        },
+        _ => RecoveryHint {
+            action: "manual-intervention".to_string(),
+            steps: vec![
+                "Inspect the command context".to_string(),
+                "Retry with adjusted inputs".to_string(),
+            ],
+        },
+    };
+    Some(hint)
 }
 
 fn default_response_meta() -> ResponseMeta {

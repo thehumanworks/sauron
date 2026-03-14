@@ -1,12 +1,23 @@
+#![allow(clippy::result_large_err, clippy::too_many_arguments)]
+
+mod artifacts;
+mod broker;
+mod broker_protocol;
 mod browser;
 mod cdp;
+mod config;
 mod context;
 mod daemon;
 mod diff;
+mod engine;
 mod errors;
+mod locators;
+mod page_cache;
+mod policy;
 mod runtime;
 mod session;
 mod snapshot;
+mod snapshot_nodes;
 #[cfg(test)]
 mod test_support;
 mod types;
@@ -39,7 +50,7 @@ use std::time::{Duration, Instant};
 )]
 struct Cli {
     /// Runtime session id override (otherwise resolved by process binding, project context, then SAURON_SESSION_ID)
-    #[arg(long, global = true)]
+    #[arg(long = "session-id", alias = "session", global = true)]
     session_id: Option<String>,
 
     /// Optional instance id override for `start` (auto-generated when omitted)
@@ -62,6 +73,10 @@ struct Cli {
     #[arg(long, global = true)]
     user_data_dir: Option<PathBuf>,
 
+    /// Named browser profile directory (human-friendly alias for user-data-dir semantics).
+    #[arg(long, global = true)]
+    profile: Option<PathBuf>,
+
     /// Optional timeout in milliseconds (command-specific defaults apply when omitted)
     #[arg(long, global = true)]
     timeout_ms: Option<u64>,
@@ -78,6 +93,50 @@ struct Cli {
     /// - Browser commands: overrides the viewport for this invocation.
     #[arg(long, global = true)]
     viewport: Option<String>,
+
+    /// Runtime handling strategy for commands that need browser connectivity.
+    #[arg(long, value_enum, global = true)]
+    ensure_runtime: Option<EnsureRuntimeArg>,
+
+    /// Force machine-readable JSON output.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Policy mode for browser actions.
+    #[arg(long, value_enum, global = true)]
+    policy: Option<policy::PolicyMode>,
+
+    /// Allow policy host(s); can be repeated.
+    #[arg(long, global = true)]
+    allow_host: Vec<String>,
+
+    /// Allow policy origin(s); can be repeated.
+    #[arg(long, global = true)]
+    allow_origin: Vec<String>,
+
+    /// Allow policy action class(es); can be repeated.
+    #[arg(long, global = true)]
+    allow_action: Vec<String>,
+
+    /// Optional JSON policy file path.
+    #[arg(long, global = true)]
+    policy_file: Option<PathBuf>,
+
+    /// Artifact output strategy for large payloads.
+    #[arg(long, value_enum, global = true)]
+    artifact_mode: Option<artifacts::ArtifactMode>,
+
+    /// Maximum bytes to include for content fields in inline output.
+    #[arg(long, global = true)]
+    max_bytes: Option<u64>,
+
+    /// Redact sensitive values in output where supported.
+    #[arg(long, global = true)]
+    redact: bool,
+
+    /// Emit content boundary metadata for long text payloads.
+    #[arg(long, global = true)]
+    content_boundaries: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -139,6 +198,199 @@ enum Commands {
         command: NetworkCommands,
     },
 
+    /// Show resolved configuration and config sources
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+
+    /// Navigate to a URL (flat task-first alias for `page goto`)
+    Open {
+        url: String,
+        #[arg(long, default_value = "load")]
+        until: String,
+    },
+
+    /// Navigate backward in history
+    Back,
+
+    /// Navigate forward in history
+    Forward,
+
+    /// Reload the current page
+    Reload,
+
+    /// Snapshot the current page
+    Snapshot {
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        #[arg(long)]
+        clickable: bool,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        include_iframes: bool,
+        #[arg(long, value_enum, default_value = "text")]
+        format: SnapshotFormatArg,
+        #[arg(long)]
+        delta: bool,
+    },
+
+    /// Capture a screenshot
+    Screenshot {
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        responsive: bool,
+        #[arg(long, value_enum, default_value = "high")]
+        quality: ScreenshotQualityArg,
+        #[arg(long)]
+        annotate: bool,
+        #[arg(long, conflicts_with = "output_dir")]
+        output: Option<PathBuf>,
+        #[arg(long, conflicts_with = "output")]
+        output_dir: Option<PathBuf>,
+    },
+
+    /// Click a target
+    Click {
+        #[command(flatten)]
+        target: FlatTargetArgs,
+        #[arg(long)]
+        double: bool,
+    },
+
+    /// Fill a target with a value
+    Fill {
+        #[command(flatten)]
+        target: FlatTargetArgs,
+        value: String,
+    },
+
+    /// Hover a target
+    Hover {
+        #[command(flatten)]
+        target: FlatTargetArgs,
+    },
+
+    /// Scroll the page or target
+    Scroll {
+        #[arg(long)]
+        direction: Option<ScrollDirectionArg>,
+        #[arg(long, default_value_t = 500)]
+        amount: i64,
+        #[command(flatten)]
+        target: FlatTargetArgs,
+    },
+
+    /// Press a key combo
+    Press { combo: String },
+
+    /// Get a page or element value
+    Get {
+        subject: String,
+        #[command(flatten)]
+        target: FlatTargetArgs,
+        #[arg(long)]
+        attr: Option<String>,
+    },
+
+    /// Evaluate a boolean condition about a target
+    Is {
+        predicate: String,
+        #[command(flatten)]
+        target: FlatTargetArgs,
+    },
+
+    /// Select an option in a select element
+    Select {
+        #[command(flatten)]
+        target: FlatTargetArgs,
+        value: String,
+    },
+
+    /// Check a checkbox/radio element
+    Check {
+        #[command(flatten)]
+        target: FlatTargetArgs,
+    },
+
+    /// Uncheck a checkbox/radio element
+    Uncheck {
+        #[command(flatten)]
+        target: FlatTargetArgs,
+    },
+
+    /// Upload file(s) to a file input element
+    Upload {
+        #[command(flatten)]
+        target: FlatTargetArgs,
+        files: Vec<String>,
+    },
+
+    /// Download a URL to a local file path
+    Download {
+        url: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+
+    /// Export current page as PDF
+    Pdf {
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Wait for a condition
+    Wait {
+        /// Positional shorthand: milliseconds for a sleep wait.
+        arg: Option<String>,
+        #[arg(long)]
+        load: Option<String>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        selector: Option<String>,
+        #[arg(long)]
+        state: Option<SelectorStateArg>,
+        #[arg(long)]
+        count: Option<u32>,
+        #[arg(long)]
+        idle: bool,
+        #[arg(long = "fn")]
+        function: Option<String>,
+    },
+
+    /// Find target(s) without acting on them
+    Find {
+        #[command(flatten)]
+        target: FlatTargetArgs,
+    },
+
+    /// Collect multiple artifacts in one command
+    Collect {
+        #[arg(long)]
+        snapshot: bool,
+        #[arg(long)]
+        screenshot: bool,
+        #[arg(long)]
+        content: bool,
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        bundle: bool,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Close current tab (or explicit index)
+    Close {
+        #[arg(long)]
+        index: Option<usize>,
+    },
+
     /// Execute a workflow file
     Run {
         #[arg(long)]
@@ -187,6 +439,28 @@ enum RuntimeCommands {
 
     /// Remove stale runtime artifacts
     Cleanup,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommands {
+    Show,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EnsureRuntimeArg {
+    Auto,
+    Require,
+    Off,
+}
+
+impl EnsureRuntimeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            EnsureRuntimeArg::Auto => "auto",
+            EnsureRuntimeArg::Require => "require",
+            EnsureRuntimeArg::Off => "off",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -358,6 +632,10 @@ enum StateCommands {
     Load { name: String },
     List,
     Delete { name: String },
+    Show { name: String },
+    Rename { from: String, to: String },
+    Clear,
+    Clean,
 }
 
 #[derive(Subcommand, Debug)]
@@ -430,10 +708,306 @@ impl TargetArgs {
     }
 }
 
+#[derive(Args, Debug, Clone, Default)]
+struct FlatTargetArgs {
+    /// Positional target shorthand. `@e1` resolves as ref, otherwise text.
+    target: Option<String>,
+    #[arg(long)]
+    selector: Option<String>,
+    #[arg(long = "ref")]
+    reference: Option<String>,
+    #[arg(long)]
+    text: Option<String>,
+    #[arg(long)]
+    role: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    placeholder: Option<String>,
+    #[arg(long = "alt")]
+    alt_text: Option<String>,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long = "test-id")]
+    test_id: Option<String>,
+    #[arg(long)]
+    nth: Option<u32>,
+    #[arg(long)]
+    exact: bool,
+}
+
+impl FlatTargetArgs {
+    fn is_empty(&self) -> bool {
+        self.target
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+            && self
+                .selector
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && self
+                .reference
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && self.text.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && self.role.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && self
+                .label
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && self
+                .placeholder
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && self
+                .alt_text
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && self
+                .title
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && self
+                .test_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+    }
+
+    fn to_target_spec(&self) -> Result<locators::TargetSpec, CliError> {
+        let mut strategy_count = 0usize;
+        if !self
+            .selector
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            strategy_count += 1;
+        }
+        if !self
+            .reference
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            strategy_count += 1;
+        }
+        if !self.text.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            strategy_count += 1;
+        }
+        if !self.role.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            strategy_count += 1;
+        }
+        if !self
+            .label
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            strategy_count += 1;
+        }
+        if !self
+            .placeholder
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            strategy_count += 1;
+        }
+        if !self
+            .alt_text
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            strategy_count += 1;
+        }
+        if !self
+            .title
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            strategy_count += 1;
+        }
+        if !self
+            .test_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            strategy_count += 1;
+        }
+        if !self
+            .target
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            strategy_count += 1;
+        }
+
+        if strategy_count != 1 {
+            return Err(CliError::bad_input(
+                "Provide exactly one target strategy",
+                "Use one of positional target, --selector, --ref, --text, --role, --label, --placeholder, --alt, --title, or --test-id",
+            ));
+        }
+
+        if let Some(selector) = self
+            .selector
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(locators::TargetSpec::Css(selector.to_string()));
+        }
+        if let Some(reference) = self
+            .reference
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(locators::TargetSpec::Ref(reference.to_string()));
+        }
+        if let Some(text) = self
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(locators::TargetSpec::Text {
+                text: text.to_string(),
+                exact: self.exact,
+                nth: self.nth,
+            });
+        }
+        if let Some(role) = self
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let name = self
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            return Ok(locators::TargetSpec::Role {
+                role: role.to_string(),
+                name,
+                nth: self.nth,
+            });
+        }
+        if let Some(label) = self
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(locators::TargetSpec::Label {
+                text: label.to_string(),
+                nth: self.nth,
+            });
+        }
+        if let Some(placeholder) = self
+            .placeholder
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(locators::TargetSpec::Placeholder {
+                text: placeholder.to_string(),
+                nth: self.nth,
+            });
+        }
+        if let Some(alt_text) = self
+            .alt_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(locators::TargetSpec::AltText {
+                text: alt_text.to_string(),
+                nth: self.nth,
+            });
+        }
+        if let Some(title) = self
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(locators::TargetSpec::Title {
+                text: title.to_string(),
+                nth: self.nth,
+            });
+        }
+        if let Some(test_id) = self
+            .test_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(locators::TargetSpec::TestId {
+                value: test_id.to_string(),
+                nth: self.nth,
+            });
+        }
+        if let Some(target) = self
+            .target
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if target.starts_with('@') {
+                return Ok(locators::TargetSpec::Ref(target.to_string()));
+            }
+            return Ok(locators::TargetSpec::Text {
+                text: target.to_string(),
+                exact: self.exact,
+                nth: self.nth,
+            });
+        }
+
+        Err(CliError::bad_input(
+            "No target provided",
+            "Provide a positional target or a target flag",
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SnapshotFormatArg {
     Text,
     Json,
+    Nodes,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -768,6 +1342,144 @@ fn ensure_runtime_or_exit(
     }
 }
 
+async fn ensure_runtime_for_flat_command(
+    store: &RuntimeStore,
+    session_id: Option<String>,
+    instance: Option<String>,
+    client: Option<String>,
+    pid_path: Option<PathBuf>,
+    user_data_dir: Option<PathBuf>,
+    port: Option<u16>,
+    timeout_ms: Option<u64>,
+    viewport_override: Option<types::Viewport>,
+    ensure_runtime: EnsureRuntimeArg,
+    command_name: &str,
+) -> Result<(ActiveRuntime, bool), CliError> {
+    match require_runtime(store, session_id.clone()) {
+        Ok(runtime) => return Ok((runtime, false)),
+        Err(error)
+            if matches!(ensure_runtime, EnsureRuntimeArg::Auto)
+                && is_session_resolution_error(&error) => {}
+        Err(error) => {
+            if matches!(
+                ensure_runtime,
+                EnsureRuntimeArg::Off | EnsureRuntimeArg::Require
+            ) && matches!(error.code, types::ErrorCode::SessionRequired)
+            {
+                return Err(session_required_error(command_name));
+            }
+            return Err(error);
+        }
+    }
+
+    let mut session =
+        create_session_record(store, session_id, instance, client, pid_path, user_data_dir)?;
+    let session_viewport = viewport_override.unwrap_or_default();
+    session.viewport_width = session_viewport.width;
+    session.viewport_height = session_viewport.height;
+
+    let ctx = AppContext::new(
+        &session.instance,
+        &session.client,
+        session.pid_path.clone(),
+        session.user_data_dir.clone(),
+    )?;
+    session.pid_path = Some(ctx.pid_path.clone());
+    session.user_data_dir = Some(ctx.user_data_dir.clone());
+
+    let timeout = timeout_ms.unwrap_or(10_000);
+    let webgl_enabled = cfg!(target_os = "macos");
+    let gpu_enabled = cfg!(target_os = "macos");
+
+    let started = daemon::start(
+        ctx.pid_path.clone(),
+        ctx.user_data_dir.clone(),
+        ctx.instance_lock_path.clone(),
+        port,
+        timeout,
+        daemon::ChromeLaunchOptions {
+            headless: true,
+            disable_gpu: !gpu_enabled,
+            webgl: webgl_enabled,
+            viewport: session_viewport,
+        },
+    )
+    .await?;
+
+    activate_session(store, &session)?;
+
+    let runtime = ActiveRuntime {
+        store: store.clone(),
+        session,
+        ctx,
+    };
+    finish_runtime_command(
+        &runtime,
+        "runtime.auto_start",
+        true,
+        json!({
+            "port": started.port,
+            "pid": started.pid,
+            "triggeredBy": command_name
+        }),
+    );
+    Ok((runtime, true))
+}
+
+fn build_policy_engine(config: &EffectiveConfig) -> Result<policy::EffectivePolicy, CliError> {
+    policy::build_policy(policy::PolicyInputs {
+        mode: config.policy_mode,
+        allow_hosts: config.allow_host.clone(),
+        allow_origins: config.allow_origin.clone(),
+        allow_actions: config.allow_action.clone(),
+        policy_file: config.policy_file.clone(),
+    })
+}
+
+fn policy_decision_error(command_name: &str, decision: &policy::PolicyDecision) -> CliError {
+    let message = format!("{} blocked by policy ({})", command_name, decision.reason);
+    CliError::new(
+        types::ErrorCode::BadInput,
+        message,
+        "Adjust policy mode/rules or choose a permitted action",
+        false,
+        4,
+    )
+}
+
+fn truncate_to_max_bytes(
+    input: &str,
+    max_bytes: Option<u64>,
+) -> (String, Option<serde_json::Value>) {
+    let Some(limit) = max_bytes else {
+        return (input.to_string(), None);
+    };
+    let limit = limit as usize;
+    if input.len() <= limit {
+        return (input.to_string(), None);
+    }
+    let truncated = input
+        .chars()
+        .scan(0usize, |count, ch| {
+            let ch_len = ch.len_utf8();
+            if *count + ch_len > limit {
+                None
+            } else {
+                *count += ch_len;
+                Some(ch)
+            }
+        })
+        .collect::<String>();
+    (
+        truncated,
+        Some(json!({
+            "truncated": true,
+            "originalBytes": input.len(),
+            "maxBytes": limit
+        })),
+    )
+}
+
 fn runtime_command_label(command: &RuntimeCommands) -> &'static str {
     match command {
         RuntimeCommands::Start { .. } => "runtime.start",
@@ -816,6 +1528,10 @@ fn state_command_label(command: &StateCommands) -> &'static str {
         StateCommands::Load { .. } => "state.load",
         StateCommands::List => "state.list",
         StateCommands::Delete { .. } => "state.delete",
+        StateCommands::Show { .. } => "state.show",
+        StateCommands::Rename { .. } => "state.rename",
+        StateCommands::Clear => "state.clear",
+        StateCommands::Clean => "state.clean",
     }
 }
 
@@ -845,6 +1561,30 @@ fn command_label(command: &Commands) -> &'static str {
         Commands::Logs { command } => log_command_label(command),
         Commands::Console { .. } => "console.capture",
         Commands::Network { .. } => "network.capture",
+        Commands::Config { .. } => "config.show",
+        Commands::Open { .. } => "open",
+        Commands::Back => "back",
+        Commands::Forward => "forward",
+        Commands::Reload => "reload",
+        Commands::Snapshot { .. } => "snapshot",
+        Commands::Screenshot { .. } => "screenshot",
+        Commands::Click { .. } => "click",
+        Commands::Fill { .. } => "fill",
+        Commands::Hover { .. } => "hover",
+        Commands::Scroll { .. } => "scroll",
+        Commands::Press { .. } => "press",
+        Commands::Get { .. } => "get",
+        Commands::Is { .. } => "is",
+        Commands::Select { .. } => "select",
+        Commands::Check { .. } => "check",
+        Commands::Uncheck { .. } => "uncheck",
+        Commands::Upload { .. } => "upload",
+        Commands::Download { .. } => "download",
+        Commands::Pdf { .. } => "pdf",
+        Commands::Wait { .. } => "wait",
+        Commands::Find { .. } => "find",
+        Commands::Collect { .. } => "collect",
+        Commands::Close { .. } => "close",
         Commands::Run { .. } => "run",
         Commands::Completions { .. } => "completions",
     }
@@ -1067,6 +1807,311 @@ fn parse_optional_viewport(input: Option<&str>) -> Result<Option<types::Viewport
     input.map(parse_viewport).transpose()
 }
 
+#[derive(Clone)]
+struct EffectiveConfig {
+    session_id: Option<String>,
+    instance: Option<String>,
+    client: Option<String>,
+    port: Option<u16>,
+    pid_path: Option<PathBuf>,
+    user_data_dir: Option<PathBuf>,
+    timeout_ms: Option<u64>,
+    viewport: Option<String>,
+    ensure_runtime: EnsureRuntimeArg,
+    json_output: bool,
+    policy_mode: policy::PolicyMode,
+    allow_host: Vec<String>,
+    allow_origin: Vec<String>,
+    allow_action: Vec<String>,
+    policy_file: Option<PathBuf>,
+    artifact_mode: artifacts::ArtifactMode,
+    max_bytes: Option<u64>,
+    redact: bool,
+    content_boundaries: bool,
+    config_layers: config::ConfigLayers,
+}
+
+fn env_opt(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_bool_value(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_u16_env(name: &str) -> Option<u16> {
+    env_opt(name).and_then(|value| value.parse::<u16>().ok())
+}
+
+fn parse_u64_env(name: &str) -> Option<u64> {
+    env_opt(name).and_then(|value| value.parse::<u64>().ok())
+}
+
+fn parse_path_env(name: &str) -> Option<PathBuf> {
+    env_opt(name).map(PathBuf::from)
+}
+
+fn parse_vec_env(name: &str) -> Option<Vec<String>> {
+    let value = env_opt(name)?;
+    let items: Vec<String> = value
+        .split(',')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if items.is_empty() {
+        None
+    } else {
+        Some(items)
+    }
+}
+
+fn parse_ensure_runtime_value(value: &str) -> Option<EnsureRuntimeArg> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(EnsureRuntimeArg::Auto),
+        "require" => Some(EnsureRuntimeArg::Require),
+        "off" => Some(EnsureRuntimeArg::Off),
+        _ => None,
+    }
+}
+
+fn parse_policy_mode_value(value: &str) -> Option<policy::PolicyMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "safe" => Some(policy::PolicyMode::Safe),
+        "confirm" => Some(policy::PolicyMode::Confirm),
+        "open" => Some(policy::PolicyMode::Open),
+        _ => None,
+    }
+}
+
+fn parse_artifact_mode_value(value: &str) -> Option<artifacts::ArtifactMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "inline" => Some(artifacts::ArtifactMode::Inline),
+        "path" => Some(artifacts::ArtifactMode::Path),
+        "manifest" => Some(artifacts::ArtifactMode::Manifest),
+        "none" => Some(artifacts::ArtifactMode::None),
+        _ => None,
+    }
+}
+
+fn is_flat_command(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Open { .. }
+            | Commands::Back
+            | Commands::Forward
+            | Commands::Reload
+            | Commands::Snapshot { .. }
+            | Commands::Screenshot { .. }
+            | Commands::Click { .. }
+            | Commands::Fill { .. }
+            | Commands::Hover { .. }
+            | Commands::Scroll { .. }
+            | Commands::Press { .. }
+            | Commands::Get { .. }
+            | Commands::Is { .. }
+            | Commands::Select { .. }
+            | Commands::Check { .. }
+            | Commands::Uncheck { .. }
+            | Commands::Upload { .. }
+            | Commands::Download { .. }
+            | Commands::Pdf { .. }
+            | Commands::Wait { .. }
+            | Commands::Find { .. }
+            | Commands::Collect { .. }
+            | Commands::Close { .. }
+    )
+}
+
+fn resolve_effective_config(cli: &Cli) -> Result<EffectiveConfig, CliError> {
+    let config_layers = config::load_config_layers()?;
+    let file_config = config_layers.merged_file_config();
+    let flat_command = is_flat_command(&cli.command);
+
+    let session_id = cli
+        .session_id
+        .clone()
+        .or_else(|| env_opt("SAURON_SESSION_ID"))
+        .or_else(|| env_opt("SAURON_SESSION"))
+        .or_else(|| file_config.session.clone())
+        .or_else(|| file_config.session_id.clone());
+
+    let instance = cli
+        .instance
+        .clone()
+        .or_else(|| env_opt("SAURON_INSTANCE"))
+        .or_else(|| file_config.instance.clone());
+    let client = cli
+        .client
+        .clone()
+        .or_else(|| env_opt("SAURON_CLIENT"))
+        .or_else(|| file_config.client.clone());
+    let port = cli
+        .port
+        .or_else(|| parse_u16_env("SAURON_PORT"))
+        .or(file_config.port);
+    let pid_path = cli
+        .pid_path
+        .clone()
+        .or_else(|| parse_path_env("SAURON_PID_PATH"))
+        .or(file_config.pid_path.clone());
+
+    let profile_path = cli
+        .profile
+        .clone()
+        .or_else(|| parse_path_env("SAURON_PROFILE"))
+        .or(file_config.profile.clone());
+    let user_data_dir = cli
+        .user_data_dir
+        .clone()
+        .or_else(|| parse_path_env("SAURON_USER_DATA_DIR"))
+        .or(file_config.user_data_dir.clone())
+        .or(profile_path);
+
+    let timeout_ms = cli
+        .timeout_ms
+        .or_else(|| parse_u64_env("SAURON_TIMEOUT_MS"))
+        .or(file_config.timeout_ms);
+    let viewport = cli
+        .viewport
+        .clone()
+        .or_else(|| env_opt("SAURON_VIEWPORT"))
+        .or(file_config.viewport.clone());
+
+    let ensure_runtime = cli
+        .ensure_runtime
+        .or_else(|| {
+            env_opt("SAURON_ENSURE_RUNTIME").and_then(|value| parse_ensure_runtime_value(&value))
+        })
+        .or_else(|| {
+            file_config
+                .ensure_runtime
+                .as_deref()
+                .and_then(parse_ensure_runtime_value)
+        })
+        .unwrap_or(if flat_command {
+            EnsureRuntimeArg::Auto
+        } else {
+            EnsureRuntimeArg::Require
+        });
+
+    let json_output = if cli.json {
+        true
+    } else if let Some(value) = env_opt("SAURON_JSON").and_then(|value| parse_bool_value(&value)) {
+        value
+    } else {
+        file_config.json.unwrap_or(false)
+    };
+
+    let policy_mode = cli
+        .policy
+        .or_else(|| env_opt("SAURON_POLICY").and_then(|value| parse_policy_mode_value(&value)))
+        .or_else(|| {
+            file_config
+                .policy
+                .as_deref()
+                .and_then(parse_policy_mode_value)
+        })
+        .unwrap_or(policy::PolicyMode::Open);
+
+    let allow_host = if !cli.allow_host.is_empty() {
+        cli.allow_host.clone()
+    } else if let Some(values) = parse_vec_env("SAURON_ALLOW_HOST") {
+        values
+    } else {
+        file_config.allow_host.clone().unwrap_or_default()
+    };
+
+    let allow_origin = if !cli.allow_origin.is_empty() {
+        cli.allow_origin.clone()
+    } else if let Some(values) = parse_vec_env("SAURON_ALLOW_ORIGIN") {
+        values
+    } else {
+        file_config.allow_origin.clone().unwrap_or_default()
+    };
+
+    let allow_action = if !cli.allow_action.is_empty() {
+        cli.allow_action.clone()
+    } else if let Some(values) = parse_vec_env("SAURON_ALLOW_ACTION") {
+        values
+    } else {
+        file_config.allow_action.clone().unwrap_or_default()
+    };
+
+    let policy_file = cli
+        .policy_file
+        .clone()
+        .or_else(|| parse_path_env("SAURON_POLICY_FILE"));
+
+    let artifact_mode = cli
+        .artifact_mode
+        .or_else(|| {
+            env_opt("SAURON_ARTIFACT_MODE").and_then(|value| parse_artifact_mode_value(&value))
+        })
+        .or_else(|| {
+            file_config
+                .artifact_mode
+                .as_deref()
+                .and_then(parse_artifact_mode_value)
+        })
+        .unwrap_or(if flat_command {
+            artifacts::ArtifactMode::Manifest
+        } else {
+            artifacts::ArtifactMode::Inline
+        });
+
+    let max_bytes = cli
+        .max_bytes
+        .or_else(|| parse_u64_env("SAURON_MAX_BYTES"))
+        .or(file_config.max_bytes);
+    let redact = if cli.redact {
+        true
+    } else if let Some(value) = env_opt("SAURON_REDACT").and_then(|value| parse_bool_value(&value))
+    {
+        value
+    } else {
+        file_config.redact.unwrap_or(false)
+    };
+    let content_boundaries = if cli.content_boundaries {
+        true
+    } else if let Some(value) =
+        env_opt("SAURON_CONTENT_BOUNDARIES").and_then(|value| parse_bool_value(&value))
+    {
+        value
+    } else {
+        file_config.content_boundaries.unwrap_or(false)
+    };
+
+    Ok(EffectiveConfig {
+        session_id,
+        instance,
+        client,
+        port,
+        pid_path,
+        user_data_dir,
+        timeout_ms,
+        viewport,
+        ensure_runtime,
+        json_output,
+        policy_mode,
+        allow_host,
+        allow_origin,
+        allow_action,
+        policy_file,
+        artifact_mode,
+        max_bytes,
+        redact,
+        content_boundaries,
+        config_layers,
+    })
+}
+
 fn screenshot_path_extension_matches(path: &std::path::Path, expected_extension: &str) -> bool {
     let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
         return true;
@@ -1127,15 +2172,20 @@ async fn main() {
         return;
     }
 
+    let effective_config = match resolve_effective_config(&cli) {
+        Ok(config) => config,
+        Err(e) => exit_with_error(command_label(&cli.command), e),
+    };
+
     let command = cli.command;
-    let session_id_flag = cli.session_id;
-    let instance_flag = cli.instance;
-    let client_flag = cli.client;
-    let port_flag = cli.port;
-    let pid_path_flag = cli.pid_path;
-    let user_data_dir_flag = cli.user_data_dir;
-    let timeout_ms_flag = cli.timeout_ms;
-    let viewport_override = match parse_optional_viewport(cli.viewport.as_deref()) {
+    let session_id_flag = effective_config.session_id.clone();
+    let instance_flag = effective_config.instance.clone();
+    let client_flag = effective_config.client.clone();
+    let port_flag = effective_config.port;
+    let pid_path_flag = effective_config.pid_path.clone();
+    let user_data_dir_flag = effective_config.user_data_dir.clone();
+    let timeout_ms_flag = effective_config.timeout_ms;
+    let viewport_override = match parse_optional_viewport(effective_config.viewport.as_deref()) {
         Ok(v) => v,
         Err(e) => exit_with_error(command_label(&command), e),
     };
@@ -1144,8 +2194,1903 @@ async fn main() {
         Ok(store) => store,
         Err(e) => exit_with_error(command_label(&command), e),
     };
+    let policy_engine = match build_policy_engine(&effective_config) {
+        Ok(policy) => policy,
+        Err(e) => exit_with_error(command_label(&command), e),
+    };
 
     match command {
+        Commands::Config { command } => match command {
+            ConfigCommands::Show => {
+                let started_at = Instant::now();
+                let command_name = "config.show";
+                let meta = build_response_meta(None, started_at);
+                print_result(&make_success_with_meta(
+                    command_name,
+                    json!({
+                        "sources": {
+                            "userConfigPath": effective_config.config_layers.user_path.to_string_lossy(),
+                            "projectConfigPath": effective_config.config_layers.project_path.to_string_lossy(),
+                            "userConfigLoaded": effective_config.config_layers.user.is_some(),
+                            "projectConfigLoaded": effective_config.config_layers.project.is_some()
+                        },
+                        "effective": {
+                            "sessionId": effective_config.session_id,
+                            "instance": effective_config.instance,
+                            "client": effective_config.client,
+                            "port": effective_config.port,
+                            "pidPath": effective_config.pid_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                            "userDataDir": effective_config.user_data_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
+                            "timeoutMs": effective_config.timeout_ms,
+                            "viewport": effective_config.viewport,
+                            "ensureRuntime": effective_config.ensure_runtime.as_str(),
+                            "json": effective_config.json_output,
+                            "policy": format!("{:?}", effective_config.policy_mode).to_ascii_lowercase(),
+                            "allowHost": effective_config.allow_host,
+                            "allowOrigin": effective_config.allow_origin,
+                            "allowAction": effective_config.allow_action,
+                            "policyFile": effective_config.policy_file.as_ref().map(|p| p.to_string_lossy().to_string()),
+                            "artifactMode": format!("{:?}", effective_config.artifact_mode).to_ascii_lowercase(),
+                            "maxBytes": effective_config.max_bytes,
+                            "redact": effective_config.redact,
+                            "contentBoundaries": effective_config.content_boundaries
+                        }
+                    }),
+                    meta,
+                ));
+            }
+        },
+        Commands::Open { url, until } => {
+            let command_name = "open";
+            let decision =
+                policy_engine.evaluate(policy::ActionClass::Navigate, Some(url.as_str()));
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let decision = decision.clone();
+                    async move {
+                        let timeout = Duration::from_millis(timeout_ms_flag.unwrap_or(30_000));
+                        let outcome = page.navigate(&url, &until, timeout).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "url": url,
+                                "status": outcome.status,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Back => {
+            let command_name = "back";
+            let decision = policy_engine.evaluate(policy::ActionClass::Navigate, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let decision = decision.clone();
+                    async move {
+                        page.go_back().await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "navigated": "back",
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Forward => {
+            let command_name = "forward";
+            let decision = policy_engine.evaluate(policy::ActionClass::Navigate, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let decision = decision.clone();
+                    async move {
+                        page.go_forward().await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "navigated": "forward",
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Reload => {
+            let command_name = "reload";
+            let decision = policy_engine.evaluate(policy::ActionClass::Navigate, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let decision = decision.clone();
+                    async move {
+                        page.reload().await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "reloaded": true,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Snapshot {
+            interactive,
+            clickable,
+            scope,
+            include_iframes,
+            format,
+            delta,
+        } => {
+            let command_name = "snapshot";
+            let decision = policy_engine.evaluate(policy::ActionClass::Read, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let opts = types::SnapshotOptions {
+                            interactive,
+                            clickable,
+                            scope: scope.clone(),
+                            include_iframes,
+                        };
+                        let snap = page.snapshot_and_persist(&cmd_ctx, opts.clone()).await?;
+                        let refs: Vec<serde_json::Value> = snap
+                            .refs
+                            .iter()
+                            .map(|(id, reference)| {
+                                json!({
+                                    "id": id,
+                                    "role": reference.role,
+                                    "name": reference.name,
+                                    "locator": reference.locator
+                                })
+                            })
+                            .collect();
+
+                        let nodes =
+                            if matches!(format, SnapshotFormatArg::Json | SnapshotFormatArg::Nodes)
+                                || delta
+                            {
+                                let ax = page.accessibility_tree().await?;
+                                Some(snapshot_nodes::flatten_snapshot_nodes(
+                                    &ax,
+                                    clickable,
+                                    scope.as_deref(),
+                                ))
+                            } else {
+                                None
+                            };
+
+                        let delta_payload = if delta {
+                            if let Some(nodes) = nodes.clone() {
+                                let current =
+                                    page_cache::build_cache_entry(snap.snapshot_id, nodes);
+                                if let Ok(Some(state)) = browser::load_ref_state(&cmd_ctx).await {
+                                    let previous_snapshot_id = state.snapshot_id.saturating_sub(1);
+                                    if previous_snapshot_id > 0 {
+                                        if let Ok(Some(previous_tree)) =
+                                            browser::load_snapshot(&cmd_ctx, previous_snapshot_id)
+                                                .await
+                                        {
+                                            let previous_nodes = previous_tree
+                                                .lines()
+                                                .enumerate()
+                                                .map(|(index, line)| snapshot_nodes::SnapshotNode {
+                                                    id: format!("l{}", index + 1),
+                                                    role: "line".to_string(),
+                                                    name: Some(line.trim().to_string()),
+                                                    value: None,
+                                                    states: Vec::new(),
+                                                    frame_id: None,
+                                                    bounds: None,
+                                                    stable_selector: None,
+                                                    actions: Vec::new(),
+                                                })
+                                                .collect::<Vec<_>>();
+                                            let previous = page_cache::build_cache_entry(
+                                                previous_snapshot_id,
+                                                previous_nodes,
+                                            );
+                                            Some(page_cache::diff_entries(&previous, &current))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        let payload = match format {
+                            SnapshotFormatArg::Text => json!({
+                                "format": "text",
+                                "url": snap.url,
+                                "snapshotId": snap.snapshot_id,
+                                "refCount": snap.refs.len(),
+                                "tree": snap.tree,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started },
+                                "delta": delta_payload
+                            }),
+                            SnapshotFormatArg::Json => json!({
+                                "format": "json",
+                                "url": snap.url,
+                                "snapshotId": snap.snapshot_id,
+                                "refCount": snap.refs.len(),
+                                "tree": snap.tree,
+                                "refs": refs,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started },
+                                "delta": delta_payload
+                            }),
+                            SnapshotFormatArg::Nodes => json!({
+                                "format": "nodes",
+                                "url": snap.url,
+                                "snapshotId": snap.snapshot_id,
+                                "refCount": snap.refs.len(),
+                                "tree": snap.tree,
+                                "refs": refs,
+                                "nodes": nodes.unwrap_or_default(),
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started },
+                                "delta": delta_payload
+                            }),
+                        };
+
+                        Ok(make_success(command_name, payload))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Screenshot {
+            full,
+            responsive,
+            quality,
+            annotate,
+            output,
+            output_dir,
+        } => {
+            let command_name = "screenshot";
+            let decision = policy_engine.evaluate(policy::ActionClass::Read, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            let artifact_mode = effective_config.artifact_mode;
+            let default_viewport = viewport_override.unwrap_or(runtime.session.viewport());
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        if !responsive {
+                            let shot = page.capture_screenshot(full, quality.to_browser()).await?;
+                            if let Some(path) = output.as_ref() {
+                                validate_screenshot_output_path(path, &shot.extension)?;
+                            }
+                            let annotations = if annotate {
+                                browser::load_ref_state(&cmd_ctx)
+                                    .await?
+                                    .map(|state| {
+                                        let mut refs: Vec<_> = state.refs.into_iter().collect();
+                                        refs.sort_by(|a, b| a.0.cmp(&b.0));
+                                        json!(
+                                            refs.into_iter()
+                                                .enumerate()
+                                                .map(|(idx, (id, item))| json!({
+                                                    "index": idx + 1,
+                                                    "ref": format!("@{}", id),
+                                                    "role": item.role,
+                                                    "name": item.name
+                                                }))
+                                                .collect::<Vec<_>>()
+                                        )
+                                    })
+                            } else {
+                                None
+                            };
+
+                            let write = artifacts::write_screenshot_artifact(
+                                &cmd_ctx.base_dir,
+                                &cmd_ctx.instance,
+                                artifact_mode,
+                                &shot.mime,
+                                &shot.extension,
+                                &shot.data,
+                                output.as_deref(),
+                                annotations.clone(),
+                            )?;
+
+                            let artifact_payload = match artifact_mode {
+                                artifacts::ArtifactMode::Inline => json!({
+                                    "mode": "inline",
+                                    "artifact": write.reference
+                                }),
+                                artifacts::ArtifactMode::Path => json!({
+                                    "mode": "path",
+                                    "path": write.reference.path,
+                                    "artifact": write.reference
+                                }),
+                                artifacts::ArtifactMode::Manifest => json!({
+                                    "mode": "manifest",
+                                    "manifest": artifacts::ArtifactManifest { items: vec![write.reference] }
+                                }),
+                                artifacts::ArtifactMode::None => json!({
+                                    "mode": "none"
+                                }),
+                            };
+
+                            return Ok(make_success(
+                                command_name,
+                                json!({
+                                    "responsive": false,
+                                    "quality": quality.as_str(),
+                                    "policy": decision,
+                                    "runtime": { "autoStarted": auto_started },
+                                    "annotationRequested": annotate,
+                                    "result": artifact_payload
+                                }),
+                            ));
+                        }
+
+                        let output_dir = if let Some(path) = output_dir.or(output.clone()) {
+                            path
+                        } else {
+                            std::env::current_dir().map_err(|e| {
+                                CliError::unknown(
+                                    format!("Failed to resolve current directory: {}", e),
+                                    "Run command from an accessible directory",
+                                )
+                            })?
+                        };
+                        tokio::fs::create_dir_all(&output_dir).await.map_err(|e| {
+                            CliError::unknown(
+                                format!(
+                                    "Failed to create screenshot directory {}: {}",
+                                    output_dir.display(),
+                                    e
+                                ),
+                                "Check filesystem permissions",
+                            )
+                        })?;
+
+                        let mut outputs = Vec::new();
+                        for preset in responsive_screenshot_presets(default_viewport) {
+                            page.set_viewport(preset.width, preset.height, preset.mobile)
+                                .await?;
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            let shot = page.capture_screenshot(full, quality.to_browser()).await?;
+                            let bytes = artifacts::decode_base64(&shot.data)?;
+                            let path = output_dir.join(format!(
+                                "screenshot-{}.{}",
+                                preset.name, shot.extension
+                            ));
+                            tokio::fs::write(&path, bytes).await.map_err(|e| {
+                                CliError::unknown(
+                                    format!("Failed to write screenshot {}: {}", path.display(), e),
+                                    "Check filesystem permissions",
+                                )
+                            })?;
+                            outputs.push(json!({
+                                "preset": preset.name,
+                                "width": preset.width,
+                                "height": preset.height,
+                                "path": path.to_string_lossy()
+                            }));
+                        }
+
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "responsive": true,
+                                "quality": quality.as_str(),
+                                "screenshots": outputs,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Click { target, double } => {
+            let command_name = "click";
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let target_spec = match target.to_target_spec() {
+                Ok(spec) => spec,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let target_spec = target_spec.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let (backend, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        page.click(backend, double).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "clicked": true,
+                                "double": double,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Fill { target, value } => {
+            let command_name = "fill";
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let target_spec = match target.to_target_spec() {
+                Ok(spec) => spec,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let target_spec = target_spec.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let (backend, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        let typ = page.fill(backend, &value).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "filled": true,
+                                "type": typ,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Hover { target } => {
+            let command_name = "hover";
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let target_spec = match target.to_target_spec() {
+                Ok(spec) => spec,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let target_spec = target_spec.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let (backend, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        page.hover(backend).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "hovered": true,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Press { combo } => {
+            let command_name = "press";
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let decision = decision.clone();
+                    async move {
+                        page.press_key(&combo).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "pressed": true,
+                                "key": combo,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Scroll {
+            direction,
+            amount,
+            target,
+        } => {
+            let command_name = "scroll";
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    let target = target.clone();
+                    async move {
+                        if let Some(direction) = direction {
+                            if !target.is_empty() {
+                                return Err(CliError::bad_input(
+                                    "Do not combine --direction with explicit target",
+                                    "Use directional scrolling or target scrolling, not both",
+                                ));
+                            }
+                            let expr = match direction {
+                                ScrollDirectionArg::Top => "window.scrollTo(0, 0)".to_string(),
+                                ScrollDirectionArg::Bottom => {
+                                    "window.scrollTo(0, document.body.scrollHeight)".to_string()
+                                }
+                                ScrollDirectionArg::Up => {
+                                    format!("window.scrollBy(0, -{})", amount)
+                                }
+                                ScrollDirectionArg::Down => {
+                                    format!("window.scrollBy(0, {})", amount)
+                                }
+                            };
+                            let _ = page.eval(&expr).await?;
+                            return Ok(make_success(
+                                command_name,
+                                json!({
+                                    "direction": format!("{:?}", direction).to_ascii_lowercase(),
+                                    "amount": amount,
+                                    "policy": decision,
+                                    "runtime": { "autoStarted": auto_started }
+                                }),
+                            ));
+                        }
+
+                        let target_spec = target.to_target_spec()?;
+                        let (backend, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        page.scroll_into_view(backend).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "scrolledIntoView": true,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Get {
+            subject,
+            target,
+            attr,
+        } => {
+            let command_name = "get";
+            let decision = policy_engine.evaluate(policy::ActionClass::Read, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let subject = subject.to_ascii_lowercase();
+            let maybe_target_spec =
+                if matches!(subject.as_str(), "text" | "html" | "value" | "attr") {
+                    match target.to_target_spec() {
+                        Ok(spec) => Some(spec),
+                        Err(err) => exit_with_error(command_name, err),
+                    }
+                } else {
+                    None
+                };
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            let max_bytes = effective_config.max_bytes;
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let decision = decision.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let maybe_target_spec = maybe_target_spec.clone();
+                    let attr = attr.clone();
+                    async move {
+                        let mut target_info: Option<locators::ResolvedTarget> = None;
+                        let value = match subject.as_str() {
+                            "url" => page.url().await?,
+                            "title" => page.title().await?,
+                            "text" => {
+                                let spec = maybe_target_spec.as_ref().ok_or_else(|| {
+                                    CliError::bad_input(
+                                        "get text requires a target",
+                                        "Provide a target via positional argument or locator flag",
+                                    )
+                                })?;
+                                let (backend, resolved) =
+                                    locators::resolve_target(&page, &cmd_ctx, spec).await?;
+                                target_info = Some(resolved);
+                                page.get_node_text(backend).await?
+                            }
+                            "html" => {
+                                let spec = maybe_target_spec.as_ref().ok_or_else(|| {
+                                    CliError::bad_input(
+                                        "get html requires a target",
+                                        "Provide a target via positional argument or locator flag",
+                                    )
+                                })?;
+                                let (backend, resolved) =
+                                    locators::resolve_target(&page, &cmd_ctx, spec).await?;
+                                target_info = Some(resolved);
+                                page.get_node_html(backend).await?
+                            }
+                            "value" => {
+                                let spec = maybe_target_spec.as_ref().ok_or_else(|| {
+                                    CliError::bad_input(
+                                        "get value requires a target",
+                                        "Provide a target via positional argument or locator flag",
+                                    )
+                                })?;
+                                let (backend, resolved) =
+                                    locators::resolve_target(&page, &cmd_ctx, spec).await?;
+                                target_info = Some(resolved);
+                                page.get_node_value(backend).await?
+                            }
+                            "attr" => {
+                                let name = attr.as_deref().ok_or_else(|| {
+                                    CliError::bad_input(
+                                        "get attr requires --attr <name>",
+                                        "Provide an attribute name, for example --attr href",
+                                    )
+                                })?;
+                                let spec = maybe_target_spec.as_ref().ok_or_else(|| {
+                                    CliError::bad_input(
+                                        "get attr requires a target",
+                                        "Provide a target via positional argument or locator flag",
+                                    )
+                                })?;
+                                let (backend, resolved) =
+                                    locators::resolve_target(&page, &cmd_ctx, spec).await?;
+                                target_info = Some(resolved);
+                                page.get_node_attr(backend, name).await?.unwrap_or_default()
+                            }
+                            _ => {
+                                return Err(CliError::bad_input(
+                                    format!("Unsupported get subject '{}'", subject),
+                                    "Use one of: url, title, text, html, value, attr",
+                                ))
+                            }
+                        };
+                        let (value, boundaries) = truncate_to_max_bytes(&value, max_bytes);
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "subject": subject,
+                                "value": value,
+                                "target": target_info,
+                                "contentBoundaries": boundaries,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Is { predicate, target } => {
+            let command_name = "is";
+            let decision = policy_engine.evaluate(policy::ActionClass::Read, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let target_spec = match target.to_target_spec() {
+                Ok(spec) => spec,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let predicate = predicate.to_ascii_lowercase();
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let target_spec = target_spec.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let (backend, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        let value = match predicate.as_str() {
+                            "visible" => page.is_node_visible(backend).await?,
+                            "enabled" => page.is_node_enabled(backend).await?,
+                            "checked" => page.is_node_checked(backend).await?,
+                            _ => {
+                                return Err(CliError::bad_input(
+                                    format!("Unsupported predicate '{}'", predicate),
+                                    "Use one of: visible, enabled, checked",
+                                ))
+                            }
+                        };
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "predicate": predicate,
+                                "value": value,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Select { target, value } => {
+            let command_name = "select";
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let target_spec = match target.to_target_spec() {
+                Ok(spec) => spec,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let target_spec = target_spec.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let (backend, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        page.select_node_value(backend, &value).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "selected": true,
+                                "value": value,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Check { target } => {
+            let command_name = "check";
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let target_spec = match target.to_target_spec() {
+                Ok(spec) => spec,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let target_spec = target_spec.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let (backend, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        page.set_node_checked(backend, true).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "checked": true,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Uncheck { target } => {
+            let command_name = "uncheck";
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let target_spec = match target.to_target_spec() {
+                Ok(spec) => spec,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let target_spec = target_spec.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let (backend, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        page.set_node_checked(backend, false).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "checked": false,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Upload { target, files } => {
+            let command_name = "upload";
+            if files.is_empty() {
+                exit_with_error(
+                    command_name,
+                    CliError::bad_input(
+                        "upload requires at least one file path",
+                        "Pass one or more file arguments after the target",
+                    ),
+                );
+            }
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let target_spec = match target.to_target_spec() {
+                Ok(spec) => spec,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let target_spec = target_spec.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    let files = files.clone();
+                    async move {
+                        let (backend, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        page.upload_files(backend, &files).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "uploaded": true,
+                                "count": files.len(),
+                                "files": files,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Download { url, output } => {
+            let command_name = "download";
+            let decision =
+                policy_engine.evaluate(policy::ActionClass::Download, Some(url.as_str()));
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let response = match reqwest::get(&url).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    exit_with_error(
+                        command_name,
+                        CliError::unknown(
+                            format!("Download request failed: {}", err),
+                            "Check network connectivity and URL",
+                        ),
+                    );
+                }
+            };
+            let status = response.status();
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    exit_with_error(
+                        command_name,
+                        CliError::unknown(
+                            format!("Failed to read download bytes: {}", err),
+                            "Retry the download command",
+                        ),
+                    );
+                }
+            };
+            if let Err(err) = std::fs::write(&output, &bytes) {
+                exit_with_error(
+                    command_name,
+                    CliError::unknown(
+                        format!("Failed to write download to {}: {}", output.display(), err),
+                        "Check filesystem permissions and parent directory",
+                    ),
+                );
+            }
+            let started_at = Instant::now();
+            let meta = build_response_meta(None, started_at);
+            print_result(&make_success_with_meta(
+                command_name,
+                json!({
+                    "downloaded": status.is_success(),
+                    "status": status.as_u16(),
+                    "url": url,
+                    "path": output.to_string_lossy(),
+                    "bytes": bytes.len(),
+                    "policy": decision
+                }),
+                meta,
+            ));
+        }
+        Commands::Pdf { output } => {
+            let command_name = "pdf";
+            let decision = policy_engine.evaluate(policy::ActionClass::Read, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let artifact_mode = effective_config.artifact_mode;
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let decision = decision.clone();
+                    let output = output.clone();
+                    async move {
+                        let data = page.print_to_pdf().await?;
+                        let bytes = artifacts::decode_base64(&data)?;
+                        let sha = artifacts::sha256_hex(&bytes);
+                        let path = match artifact_mode {
+                            artifacts::ArtifactMode::Path | artifacts::ArtifactMode::Manifest => {
+                                let target_path = if let Some(path) = output.clone() {
+                                    path
+                                } else {
+                                    artifacts::write_artifact(
+                                        &artifacts::artifact_root(&cmd_ctx.base_dir, &cmd_ctx.instance),
+                                        "page",
+                                        "pdf",
+                                        &bytes,
+                                    )?
+                                };
+                                std::fs::write(&target_path, &bytes).map_err(|e| {
+                                    CliError::unknown(
+                                        format!("Failed to write PDF {}: {}", target_path.display(), e),
+                                        "Check filesystem permissions",
+                                    )
+                                })?;
+                                Some(target_path)
+                            }
+                            _ => output.clone(),
+                        };
+                        let artifact = artifacts::ArtifactRef {
+                            kind: "pdf".to_string(),
+                            mime: "application/pdf".to_string(),
+                            path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                            inline_data: if matches!(artifact_mode, artifacts::ArtifactMode::Inline) {
+                                Some(data)
+                            } else {
+                                None
+                            },
+                            bytes: Some(bytes.len() as u64),
+                            sha256: Some(sha),
+                            annotations: None,
+                        };
+                        let data = match artifact_mode {
+                            artifacts::ArtifactMode::Inline => json!({ "mode": "inline", "artifact": artifact }),
+                            artifacts::ArtifactMode::Path => json!({ "mode": "path", "artifact": artifact }),
+                            artifacts::ArtifactMode::Manifest => json!({ "mode": "manifest", "manifest": artifacts::ArtifactManifest { items: vec![artifact] }}),
+                            artifacts::ArtifactMode::None => json!({ "mode": "none" }),
+                        };
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "result": data,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Wait {
+            arg,
+            load,
+            text,
+            url,
+            selector,
+            state,
+            count,
+            idle,
+            function,
+        } => {
+            let command_name = "wait";
+            let decision = policy_engine.evaluate(policy::ActionClass::Read, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let decision = decision.clone();
+                    async move {
+                        let timeout = Duration::from_millis(timeout_ms_flag.unwrap_or(30_000));
+                        let mut selected = 0usize;
+                        let positional_ms = arg
+                            .as_deref()
+                            .and_then(|value| value.parse::<u64>().ok());
+                        if positional_ms.is_some() {
+                            selected += 1;
+                        }
+                        if load.is_some() {
+                            selected += 1;
+                        }
+                        if text.is_some() {
+                            selected += 1;
+                        }
+                        if url.is_some() {
+                            selected += 1;
+                        }
+                        if selector.is_some() {
+                            selected += 1;
+                        }
+                        if idle {
+                            selected += 1;
+                        }
+                        if function.is_some() {
+                            selected += 1;
+                        }
+                        if selected != 1 {
+                            return Err(CliError::bad_input(
+                                "Provide exactly one wait condition",
+                                "Use one of positional milliseconds, --load, --text, --url, --selector, --idle, or --fn",
+                            ));
+                        }
+                        if let Some(ms) = positional_ms {
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                            return Ok(make_success(
+                                command_name,
+                                json!({
+                                    "waited": true,
+                                    "forMs": ms,
+                                    "policy": decision,
+                                    "runtime": { "autoStarted": auto_started }
+                                }),
+                            ));
+                        }
+                        if let Some(load_state) = load {
+                            page.wait_for_load_state(&load_state, timeout).await?;
+                            return Ok(make_success(
+                                command_name,
+                                json!({
+                                    "waited": true,
+                                    "load": load_state,
+                                    "policy": decision,
+                                    "runtime": { "autoStarted": auto_started }
+                                }),
+                            ));
+                        }
+                        if let Some(needle) = text {
+                            page.wait_for_text(&needle, timeout).await?;
+                            return Ok(make_success(
+                                command_name,
+                                json!({
+                                    "waited": true,
+                                    "text": needle,
+                                    "policy": decision,
+                                    "runtime": { "autoStarted": auto_started }
+                                }),
+                            ));
+                        }
+                        if let Some(pattern) = url {
+                            page.wait_for_url(&pattern, timeout).await?;
+                            return Ok(make_success(
+                                command_name,
+                                json!({
+                                    "waited": true,
+                                    "url": pattern,
+                                    "policy": decision,
+                                    "runtime": { "autoStarted": auto_started }
+                                }),
+                            ));
+                        }
+                        if let Some(sel) = selector {
+                            let outcome = page
+                                .wait_for_selector_state(
+                                    &sel,
+                                    state.unwrap_or(SelectorStateArg::Attached).to_browser(),
+                                    count,
+                                    timeout,
+                                )
+                                .await?;
+                            return Ok(make_success(
+                                command_name,
+                                json!({
+                                    "waited": true,
+                                    "selector": outcome.selector,
+                                    "state": outcome.state.as_str(),
+                                    "count": outcome.count,
+                                    "visibleCount": outcome.visible_count,
+                                    "expectedCount": outcome.expected_count,
+                                    "policy": decision,
+                                    "runtime": { "autoStarted": auto_started }
+                                }),
+                            ));
+                        }
+                        if idle {
+                            page.wait_for_idle(timeout).await?;
+                            return Ok(make_success(
+                                command_name,
+                                json!({
+                                    "waited": true,
+                                    "idle": true,
+                                    "policy": decision,
+                                    "runtime": { "autoStarted": auto_started }
+                                }),
+                            ));
+                        }
+                        if let Some(expr) = function {
+                            page.wait_for_function(&expr, timeout).await?;
+                            return Ok(make_success(
+                                command_name,
+                                json!({
+                                    "waited": true,
+                                    "function": expr,
+                                    "policy": decision,
+                                    "runtime": { "autoStarted": auto_started }
+                                }),
+                            ));
+                        }
+                        Err(CliError::unknown("No wait condition selected", "Retry with a wait option"))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Find { target } => {
+            let command_name = "find";
+            let decision = policy_engine.evaluate(policy::ActionClass::Read, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let target_spec = match target.to_target_spec() {
+                Ok(spec) => spec,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let target_spec = target_spec.clone();
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let (_, resolved) =
+                            locators::resolve_target(&page, &cmd_ctx, &target_spec).await?;
+                        Ok(make_success(
+                            command_name,
+                            json!({
+                                "found": true,
+                                "target": resolved,
+                                "policy": decision,
+                                "runtime": { "autoStarted": auto_started }
+                            }),
+                        ))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Collect {
+            snapshot,
+            screenshot,
+            content,
+            full,
+            bundle,
+            output,
+        } => {
+            let command_name = "collect";
+            let decision = policy_engine.evaluate(policy::ActionClass::Read, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            if !(snapshot || screenshot || content) {
+                exit_with_error(
+                    command_name,
+                    CliError::bad_input(
+                        "collect requires at least one action flag",
+                        "Use one or more of --snapshot, --screenshot, --content",
+                    ),
+                );
+            }
+            let artifact_mode = effective_config.artifact_mode;
+            let max_bytes = effective_config.max_bytes;
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_command(
+                &mut runtime,
+                port_flag,
+                viewport_override,
+                command_name,
+                move |page| {
+                    let cmd_ctx = cmd_ctx.clone();
+                    let decision = decision.clone();
+                    async move {
+                        let mut output_payload = json!({
+                            "policy": decision,
+                            "runtime": { "autoStarted": auto_started }
+                        });
+
+                        let current_url = page.url().await.unwrap_or_default();
+                        output_payload["url"] = json!(current_url);
+
+                        let mut bundle_manifest: Vec<artifacts::ArtifactRef> = Vec::new();
+
+                        if snapshot {
+                            let snap = page
+                                .snapshot_and_persist(
+                                    &cmd_ctx,
+                                    types::SnapshotOptions {
+                                        interactive: false,
+                                        clickable: false,
+                                        scope: None,
+                                        include_iframes: false,
+                                    },
+                                )
+                                .await?;
+                            output_payload["snapshot"] = json!({
+                                "snapshotId": snap.snapshot_id,
+                                "refCount": snap.refs.len(),
+                                "tree": snap.tree
+                            });
+                        }
+
+                        if screenshot {
+                            let shot = page.capture_screenshot(full, browser::ScreenshotQuality::High).await?;
+                            let write = artifacts::write_screenshot_artifact(
+                                &cmd_ctx.base_dir,
+                                &cmd_ctx.instance,
+                                artifact_mode,
+                                &shot.mime,
+                                &shot.extension,
+                                &shot.data,
+                                output.as_deref(),
+                                None,
+                            )?;
+                            bundle_manifest.push(write.reference.clone());
+                            output_payload["screenshot"] = match artifact_mode {
+                                artifacts::ArtifactMode::Inline => json!({ "mode": "inline", "artifact": write.reference }),
+                                artifacts::ArtifactMode::Path => json!({ "mode": "path", "artifact": write.reference }),
+                                artifacts::ArtifactMode::Manifest => json!({ "mode": "manifest", "manifest": artifacts::ArtifactManifest { items: vec![write.reference] } }),
+                                artifacts::ArtifactMode::None => json!({ "mode": "none" }),
+                            };
+                        }
+
+                        if content {
+                            let markdown = page.extract_markdown().await?;
+                            let (markdown, boundaries) = truncate_to_max_bytes(&markdown, max_bytes);
+                            output_payload["content"] = json!(markdown);
+                            if let Some(boundaries) = boundaries {
+                                output_payload["contentBoundaries"] = boundaries;
+                            }
+                        }
+
+                        if bundle {
+                            output_payload["bundle"] = json!({
+                                "url": output_payload["url"],
+                                "snapshot": output_payload.get("snapshot").cloned(),
+                                "artifacts": artifacts::ArtifactManifest { items: bundle_manifest },
+                                "recovery": {
+                                    "steps": ["resnapshot", "reacquire-session", "reopen-page"]
+                                }
+                            });
+                        }
+
+                        Ok(make_success(command_name, output_payload))
+                    }
+                },
+            )
+            .await;
+        }
+        Commands::Close { index } => {
+            let command_name = "close";
+            let decision = policy_engine.evaluate(policy::ActionClass::Interact, None);
+            if !matches!(decision.decision, policy::PolicyDecisionKind::Allow) {
+                exit_with_error(command_name, policy_decision_error(command_name, &decision));
+            }
+            let (mut runtime, auto_started) = match ensure_runtime_for_flat_command(
+                &store,
+                session_id_flag.clone(),
+                instance_flag.clone(),
+                client_flag.clone(),
+                pid_path_flag.clone(),
+                user_data_dir_flag.clone(),
+                port_flag,
+                timeout_ms_flag,
+                viewport_override,
+                effective_config.ensure_runtime,
+                command_name,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(err) => exit_with_error(command_name, err),
+            };
+            let cmd_ctx = runtime.ctx.clone();
+            with_browser_only_command(&mut runtime, port_flag, command_name, move |browser| {
+                let cmd_ctx = cmd_ctx.clone();
+                let decision = decision.clone();
+                async move {
+                    let pages = browser.get_targets().await?;
+                    let pages: Vec<_> = pages
+                        .into_iter()
+                        .filter(|target| target.target_type == "page")
+                        .collect();
+                    if pages.is_empty() {
+                        return Err(CliError::bad_input(
+                            "No tabs are available to close",
+                            "Open a page before running close",
+                        ));
+                    }
+
+                    let selected_index = if let Some(index) = index {
+                        if index >= pages.len() {
+                            return Err(CliError::bad_input(
+                                format!("Tab index {} out of range ({} tabs)", index, pages.len()),
+                                "Run 'sauron tab list' to inspect available tabs",
+                            ));
+                        }
+                        index
+                    } else if let Some(bound) = browser::get_bound_target_id(&cmd_ctx)? {
+                        pages
+                            .iter()
+                            .position(|target| target.target_id == bound)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                    let target_id = pages[selected_index].target_id.clone();
+                    browser.close_target(&target_id).await?;
+
+                    Ok(make_success(
+                        command_name,
+                        json!({
+                            "closed": true,
+                            "index": selected_index,
+                            "targetId": target_id,
+                            "policy": decision,
+                            "runtime": { "autoStarted": auto_started }
+                        }),
+                    ))
+                }
+            })
+            .await;
+        }
         Commands::Runtime { command } => match command {
             RuntimeCommands::Start {
                 webgl,
@@ -1486,7 +4431,7 @@ async fn main() {
                                 let opts = types::SnapshotOptions {
                                     interactive,
                                     clickable,
-                                    scope,
+                                    scope: scope.clone(),
                                     include_iframes,
                                 };
                                 let snap = page.snapshot_and_persist(&cmd_ctx, opts).await?;
@@ -1519,6 +4464,23 @@ async fn main() {
                                         "tree": snap.tree,
                                         "refs": refs
                                     }),
+                                    SnapshotFormatArg::Nodes => {
+                                        let ax = page.accessibility_tree().await?;
+                                        let nodes = snapshot_nodes::flatten_snapshot_nodes(
+                                            &ax,
+                                            clickable,
+                                            scope.as_deref(),
+                                        );
+                                        json!({
+                                            "format": "nodes",
+                                            "url": snap.url,
+                                            "snapshotId": snap.snapshot_id,
+                                            "refCount": snap.refs.len(),
+                                            "tree": snap.tree,
+                                            "refs": refs,
+                                            "nodes": nodes
+                                        })
+                                    }
                                 };
 
                                 Ok(make_success("page.snapshot", payload))
@@ -1534,6 +4496,8 @@ async fn main() {
                     output,
                     output_dir,
                 } => {
+                    let cmd_ctx = ctx.clone();
+                    let artifact_mode = effective_config.artifact_mode;
                     let responsive_desktop =
                         viewport_override.unwrap_or(runtime.session.viewport());
                     with_browser_command(
@@ -1541,7 +4505,9 @@ async fn main() {
                         port_flag,
                         viewport_override,
                         "page.screenshot",
-                        |page| async move {
+                        move |page| {
+                            let cmd_ctx = cmd_ctx.clone();
+                            async move {
                             let quality_profile = quality.to_browser();
                             let output_file = output.clone();
                             let output_dir_arg = output_dir.clone();
@@ -1688,16 +4654,48 @@ async fn main() {
                                 ))
                             } else {
                                 let shot = page.capture_screenshot(full, quality_profile).await?;
-                                Ok(make_success(
-                                    "page.screenshot",
-                                    json!({
-                                        "mode": "inline",
-                                        "data": shot.data,
-                                        "mime": shot.mime,
-                                        "quality": quality.as_str()
-                                    }),
-                                ))
+                                if matches!(artifact_mode, artifacts::ArtifactMode::Inline) {
+                                    Ok(make_success(
+                                        "page.screenshot",
+                                        json!({
+                                            "mode": "inline",
+                                            "data": shot.data,
+                                            "mime": shot.mime,
+                                            "quality": quality.as_str()
+                                        }),
+                                    ))
+                                } else {
+                                    let write = artifacts::write_screenshot_artifact(
+                                        &cmd_ctx.base_dir,
+                                        &cmd_ctx.instance,
+                                        artifact_mode,
+                                        &shot.mime,
+                                        &shot.extension,
+                                        &shot.data,
+                                        None,
+                                        None,
+                                    )?;
+                                    let payload = match artifact_mode {
+                                        artifacts::ArtifactMode::Path => json!({
+                                            "mode": "path",
+                                            "artifact": write.reference,
+                                            "quality": quality.as_str()
+                                        }),
+                                        artifacts::ArtifactMode::Manifest => json!({
+                                            "mode": "manifest",
+                                            "manifest": artifacts::ArtifactManifest { items: vec![write.reference] },
+                                            "quality": quality.as_str()
+                                        }),
+                                        artifacts::ArtifactMode::None => json!({
+                                            "mode": "none",
+                                            "quality": quality.as_str()
+                                        }),
+                                        artifacts::ArtifactMode::Inline => unreachable!(),
+                                    };
+                                    Ok(make_success("page.screenshot", payload))
+                                }
                             }
+                        }
                         },
                     )
                     .await;
@@ -1715,6 +4713,8 @@ async fn main() {
                     output,
                 } => {
                     let cmd_ctx = ctx.clone();
+                    let artifact_mode = effective_config.artifact_mode;
+                    let max_bytes = effective_config.max_bytes;
                     with_browser_command(
                         &mut runtime,
                         port_flag,
@@ -1722,6 +4722,8 @@ async fn main() {
                         "page.collect",
                         move |page| {
                             let cmd_ctx = cmd_ctx.clone();
+                            let artifact_mode = artifact_mode;
+                            let max_bytes = max_bytes;
                             async move {
                                 if !(snapshot || screenshot || content) {
                                     return Err(CliError::bad_input(
@@ -1760,6 +4762,7 @@ async fn main() {
                                 let page_for_screenshot = page.clone();
                                 let screenshot_path_for_task = output.clone();
                                 let screenshot_quality_for_task = quality.to_browser();
+                                let cmd_ctx_for_screenshot = cmd_ctx.clone();
                                 let screenshot_fut = async move {
                                     if !screenshot {
                                         return Ok::<Option<serde_json::Value>, CliError>(None);
@@ -1796,12 +4799,42 @@ async fn main() {
                                             "mime": shot.mime,
                                             "quality": quality.as_str()
                                         })))
-                                    } else {
+                                    } else if matches!(artifact_mode, artifacts::ArtifactMode::Inline) {
                                         Ok(Some(json!({
+                                            "mode": "inline",
                                             "data": shot.data,
                                             "mime": shot.mime,
                                             "quality": quality.as_str()
                                         })))
+                                    } else {
+                                        let write = artifacts::write_screenshot_artifact(
+                                            &cmd_ctx_for_screenshot.base_dir,
+                                            &cmd_ctx_for_screenshot.instance,
+                                            artifact_mode,
+                                            &shot.mime,
+                                            &shot.extension,
+                                            &shot.data,
+                                            None,
+                                            None,
+                                        )?;
+                                        let payload = match artifact_mode {
+                                            artifacts::ArtifactMode::Path => json!({
+                                                "mode": "path",
+                                                "artifact": write.reference,
+                                                "quality": quality.as_str()
+                                            }),
+                                            artifacts::ArtifactMode::Manifest => json!({
+                                                "mode": "manifest",
+                                                "manifest": artifacts::ArtifactManifest { items: vec![write.reference] },
+                                                "quality": quality.as_str()
+                                            }),
+                                            artifacts::ArtifactMode::None => json!({
+                                                "mode": "none",
+                                                "quality": quality.as_str()
+                                            }),
+                                            artifacts::ArtifactMode::Inline => unreachable!(),
+                                        };
+                                        Ok(Some(payload))
                                     }
                                 };
 
@@ -1811,6 +4844,7 @@ async fn main() {
                                         return Ok::<Option<String>, CliError>(None);
                                     }
                                     let markdown = page_for_content.extract_markdown().await?;
+                                    let (markdown, _) = truncate_to_max_bytes(&markdown, max_bytes);
                                     Ok(Some(markdown))
                                 };
 
@@ -2597,7 +5631,9 @@ async fn main() {
                                         "name": data.name,
                                         "savedAt": data.saved_at,
                                         "url": data.url,
-                                        "cookieCount": data.cookies.len()
+                                        "cookieCount": data.cookies.len(),
+                                        "localStorageOrigins": data.local_storage.len(),
+                                        "sessionStorageOrigins": data.session_storage.len()
                                     }),
                                 ))
                             }
@@ -2609,7 +5645,9 @@ async fn main() {
                                         "action": "load",
                                         "name": data.name,
                                         "url": data.url,
-                                        "cookieCount": data.cookies.len()
+                                        "cookieCount": data.cookies.len(),
+                                        "localStorageOrigins": data.local_storage.len(),
+                                        "sessionStorageOrigins": data.session_storage.len()
                                     }),
                                 ))
                             }
@@ -2625,6 +5663,48 @@ async fn main() {
                                 Ok(make_success(
                                     command_name,
                                     json!({ "action": "delete", "name": name, "deleted": ok }),
+                                ))
+                            }
+                            StateCommands::Show { name } => {
+                                let metadata = session::show_session(&cmd_ctx, &name).await?;
+                                Ok(make_success(
+                                    command_name,
+                                    json!({
+                                        "action": "show",
+                                        "session": metadata
+                                    }),
+                                ))
+                            }
+                            StateCommands::Rename { from, to } => {
+                                let renamed = session::rename_session(&cmd_ctx, &from, &to).await?;
+                                Ok(make_success(
+                                    command_name,
+                                    json!({
+                                        "action": "rename",
+                                        "from": from,
+                                        "to": to,
+                                        "renamed": renamed
+                                    }),
+                                ))
+                            }
+                            StateCommands::Clear => {
+                                let removed = session::clear_sessions(&cmd_ctx).await?;
+                                Ok(make_success(
+                                    command_name,
+                                    json!({
+                                        "action": "clear",
+                                        "removed": removed
+                                    }),
+                                ))
+                            }
+                            StateCommands::Clean => {
+                                let removed = session::clean_sessions(&cmd_ctx).await?;
+                                Ok(make_success(
+                                    command_name,
+                                    json!({
+                                        "action": "clean",
+                                        "removed": removed
+                                    }),
                                 ))
                             }
                         }

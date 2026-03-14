@@ -7,8 +7,9 @@ This is a rewrite of the attached Bun/TypeScript `sauron` project as a compiled 
 ## Goals
 
 - **Agent-friendly** JSON output for all commands (v2 envelope)
+- **Task-first UX** for everyday browser commands (`open`, `snapshot`, `click`, `fill`, `wait`, `get`)
 - **Fast** startup and execution (single static-ish binary)
-- **Process-safe concurrency** with mandatory runtime sessions (`start` before browser commands)
+- **Process-safe concurrency** with runtime sessions, plus controlled auto-runtime on flat commands
 - **Per-session isolation** with generated `session_id`, `instance`, and `client` IDs by default
 - Filesystem-only runtime state storage under `~/.sauron/runtime/`
 - Uses Chrome **`--headless=new`** only (opinionated headless runtime)
@@ -72,30 +73,46 @@ The `sauron` launcher inside the package selects the matching binary for the cur
 
 ## Quick start
 
-Start a runtime session before browser commands:
+Use the flat surface directly (auto-runtime defaults to `auto` on flat commands):
 
 ```bash
-sauron runtime start
+sauron open https://example.com
+sauron snapshot -i
+sauron get title
+sauron click @e2
+sauron wait --load networkidle
+sauron screenshot --annotate --artifact-mode manifest
 ```
 
-macOS defaults to GPU + WebGL on `runtime start` (opt out with `--no-webgl --no-gpu`).
-
-Then run browser commands from the same project directory. Later `sauron` invocations can reuse that session from separate subprocesses in the same shell or agent workflow:
+To inspect resolved config and precedence:
 
 ```bash
-sauron page goto https://example.com
-sauron page snapshot --format json
-sauron input click --ref @e1
-sauron page screenshot --responsive --quality medium
+sauron config show
 ```
 
-Clean up with:
+`sauron` supports config layering:
+
+- `~/.sauron/config.json`
+- `./sauron.json`
+- environment variables
+- CLI flags
+
+Precedence is: `user config < project config < env < CLI`.
+
+To force explicit runtime behavior on flat commands:
+
+```bash
+sauron --ensure-runtime require open https://example.com
+sauron --ensure-runtime off open https://example.com
+```
+
+To stop the active runtime when finished:
 
 ```bash
 sauron runtime stop
 ```
 
-## Mandatory session lifecycle
+## Legacy Grouped Surface
 
 - Most non-`runtime start` commands require an active runtime session. `runtime status` is the exception: it can also report `stopped` when no active session exists.
 - Session resolution order is:
@@ -112,6 +129,15 @@ sauron runtime stop
 
 ```bash
 sauron --session-id mysession --instance work --client alice runtime start
+```
+
+Grouped command examples remain valid and stable:
+
+```bash
+sauron page goto https://example.com
+sauron page snapshot --format nodes
+sauron input click --ref @e1
+sauron state show baseline
 ```
 
 ## Interaction Flow
@@ -191,10 +217,11 @@ Each line includes timestamp, session metadata, command name, status, and error 
 
 ## CLI flag placement
 
-Global flags (`--session-id`, `--port`, etc.) must be placed before the subcommand:
+Global flags (`--session-id`/`--session`, `--port`, `--policy`, `--artifact-mode`, etc.) must be placed before the subcommand:
 
 ```bash
 sauron --session-id mysession page goto https://example.com
+sauron --session qa open https://example.com
 ```
 
 `--viewport` is global and applies to `start` and browser commands:
@@ -202,6 +229,12 @@ sauron --session-id mysession page goto https://example.com
 ```bash
 sauron --viewport 1440x900 runtime start
 sauron --viewport 390x844 page screenshot
+```
+
+`--profile` is a higher-level alias for browser profile persistence:
+
+```bash
+sauron --profile ./profiles/qa runtime start
 ```
 
 ## Output contract
@@ -236,6 +269,17 @@ All commands return exactly one JSON object in a unified v2 envelope:
   }
 }
 ```
+
+## Scorecard and Benchmarks
+
+Run the parity benchmark harness:
+
+```bash
+cargo build --release
+BENCH_RUNS=5 scripts/benchmark-matrix.sh
+```
+
+Latest comparison document: [docs/agent-browser-scorecard.md](/Users/mish/dev/sauron/docs/agent-browser-scorecard.md)
 
 ## Notes
 

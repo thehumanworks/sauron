@@ -57,6 +57,17 @@ pub struct ScreenshotData {
     pub extension: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticLocatorKind {
+    Text,
+    Role,
+    Label,
+    Placeholder,
+    AltText,
+    Title,
+    TestId,
+}
+
 // --- Browser connection ---
 
 #[derive(Clone)]
@@ -943,6 +954,127 @@ impl PageClient {
         Ok(backend_node_id)
     }
 
+    pub async fn count_semantic_matches(
+        &self,
+        kind: SemanticLocatorKind,
+        query: &str,
+        secondary: Option<&str>,
+    ) -> Result<u32, CliError> {
+        let count_expr = semantic_locator_expression(kind, query, secondary, None, true)?;
+        let value = self.eval(&count_expr).await?;
+        Ok(value_to_u32(Some(&value)).unwrap_or(0))
+    }
+
+    pub async fn resolve_semantic_backend_node_id(
+        &self,
+        kind: SemanticLocatorKind,
+        query: &str,
+        secondary: Option<&str>,
+        nth: Option<u32>,
+    ) -> Result<(u64, u32), CliError> {
+        let candidate_count = self.count_semantic_matches(kind, query, secondary).await?;
+        if candidate_count == 0 {
+            return Err(CliError::new(
+                crate::types::ErrorCode::ElementNotFound,
+                format!(
+                    "No element matched semantic locator kind={} query='{}'",
+                    semantic_kind_name(kind),
+                    query
+                ),
+                "Inspect the page snapshot and adjust the locator",
+                true,
+                1,
+            ));
+        }
+
+        let index = nth.unwrap_or(0);
+        if index >= candidate_count {
+            return Err(CliError::new(
+                crate::types::ErrorCode::ElementAmbiguous,
+                format!(
+                    "Semantic locator matched {} elements; index {} is out of range",
+                    candidate_count, index
+                ),
+                format!(
+                    "Use --nth between 0 and {}",
+                    candidate_count.saturating_sub(1)
+                ),
+                true,
+                1,
+            ));
+        }
+        if nth.is_none() && candidate_count > 1 {
+            return Err(CliError::new(
+                crate::types::ErrorCode::ElementAmbiguous,
+                format!("Semantic locator matched {} elements", candidate_count),
+                "Refine the locator or use --nth to pick a specific match",
+                true,
+                1,
+            ));
+        }
+
+        let target_expr = semantic_locator_expression(kind, query, secondary, Some(index), false)?;
+        let resolved = self
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": target_expr,
+                    "returnByValue": false,
+                    "awaitPromise": true
+                }),
+                CDP_TIMEOUT,
+            )
+            .await?;
+
+        let subtype = resolved
+            .get("result")
+            .and_then(|v| v.get("subtype"))
+            .and_then(|v| v.as_str());
+        if subtype == Some("null") {
+            return Err(CliError::new(
+                crate::types::ErrorCode::ElementNotFound,
+                "Semantic locator returned null element".to_string(),
+                "Try a more specific locator",
+                true,
+                1,
+            ));
+        }
+
+        let object_id = resolved
+            .get("result")
+            .and_then(|v| v.get("objectId"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                CliError::unknown(
+                    "Runtime.evaluate did not return objectId for semantic locator",
+                    "Retry once; if it persists, capture a fresh snapshot",
+                )
+            })?;
+
+        let described = self
+            .call(
+                "DOM.describeNode",
+                json!({ "objectId": object_id }),
+                CDP_TIMEOUT,
+            )
+            .await?;
+        let backend_node_id = described
+            .get("node")
+            .and_then(|v| v.get("backendNodeId"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                CliError::new(
+                    crate::types::ErrorCode::ElementNotInteractive,
+                    "Semantic locator resolved to a node without backend DOM id".to_string(),
+                    "Retry after the page settles or choose another element",
+                    true,
+                    1,
+                )
+            })?;
+
+        Ok((backend_node_id, candidate_count))
+    }
+
     pub async fn scroll_into_view(&self, backend_node_id: u64) -> Result<(), CliError> {
         let _ = self
             .call(
@@ -1075,6 +1207,263 @@ impl PageClient {
             .unwrap_or("input");
 
         Ok(typ.to_string())
+    }
+
+    async fn object_id_from_backend(&self, backend_node_id: u64) -> Result<String, CliError> {
+        let resolved = self
+            .call(
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend_node_id }),
+                CDP_TIMEOUT,
+            )
+            .await?;
+        resolved
+            .get("object")
+            .and_then(|o| o.get("objectId"))
+            .and_then(|v| v.as_str())
+            .map(|value| value.to_string())
+            .ok_or_else(|| CliError::unknown("DOM.resolveNode missing objectId", ""))
+    }
+
+    async fn call_node_function(
+        &self,
+        backend_node_id: u64,
+        function_declaration: &str,
+        arguments: Vec<Value>,
+    ) -> Result<Value, CliError> {
+        let object_id = self.object_id_from_backend(backend_node_id).await?;
+        let response = self
+            .call(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": function_declaration,
+                    "arguments": arguments,
+                    "returnByValue": true
+                }),
+                CDP_TIMEOUT,
+            )
+            .await?;
+
+        Ok(response
+            .get("result")
+            .and_then(|value| value.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    pub async fn get_node_text(&self, backend_node_id: u64) -> Result<String, CliError> {
+        let value = self
+            .call_node_function(
+                backend_node_id,
+                "function() { return (this.innerText || this.textContent || '').trim(); }",
+                vec![],
+            )
+            .await?;
+        Ok(value.as_str().unwrap_or_default().to_string())
+    }
+
+    pub async fn get_node_html(&self, backend_node_id: u64) -> Result<String, CliError> {
+        let value = self
+            .call_node_function(
+                backend_node_id,
+                "function() { return this.outerHTML || ''; }",
+                vec![],
+            )
+            .await?;
+        Ok(value.as_str().unwrap_or_default().to_string())
+    }
+
+    pub async fn get_node_value(&self, backend_node_id: u64) -> Result<String, CliError> {
+        let value = self
+            .call_node_function(
+                backend_node_id,
+                "function() { return (this.value ?? '').toString(); }",
+                vec![],
+            )
+            .await?;
+        Ok(value.as_str().unwrap_or_default().to_string())
+    }
+
+    pub async fn get_node_attr(
+        &self,
+        backend_node_id: u64,
+        name: &str,
+    ) -> Result<Option<String>, CliError> {
+        let value = self
+            .call_node_function(
+                backend_node_id,
+                "function(attr) { const v = this.getAttribute ? this.getAttribute(attr) : null; return v === undefined ? null : v; }",
+                vec![json!({ "value": name })],
+            )
+            .await?;
+        if value.is_null() {
+            Ok(None)
+        } else {
+            Ok(value.as_str().map(|v| v.to_string()))
+        }
+    }
+
+    pub async fn is_node_visible(&self, backend_node_id: u64) -> Result<bool, CliError> {
+        let value = self
+            .call_node_function(
+                backend_node_id,
+                "function() { const rect = this.getBoundingClientRect ? this.getBoundingClientRect() : null; if (!rect) return false; const style = window.getComputedStyle(this); if (!style) return false; if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false; return rect.width > 0 && rect.height > 0; }",
+                vec![],
+            )
+            .await?;
+        Ok(value.as_bool().unwrap_or(false))
+    }
+
+    pub async fn is_node_enabled(&self, backend_node_id: u64) -> Result<bool, CliError> {
+        let value = self
+            .call_node_function(
+                backend_node_id,
+                "function() { return !this.disabled; }",
+                vec![],
+            )
+            .await?;
+        Ok(value.as_bool().unwrap_or(false))
+    }
+
+    pub async fn is_node_checked(&self, backend_node_id: u64) -> Result<bool, CliError> {
+        let value = self
+            .call_node_function(
+                backend_node_id,
+                "function() { return !!this.checked; }",
+                vec![],
+            )
+            .await?;
+        Ok(value.as_bool().unwrap_or(false))
+    }
+
+    pub async fn set_node_checked(
+        &self,
+        backend_node_id: u64,
+        checked: bool,
+    ) -> Result<(), CliError> {
+        let value = self
+            .call_node_function(
+                backend_node_id,
+                "function(next) { if (this.checked === undefined) return false; this.checked = !!next; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); return true; }",
+                vec![json!({ "value": checked })],
+            )
+            .await?;
+        if value.as_bool().unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(CliError::new(
+                crate::types::ErrorCode::ElementNotInteractive,
+                "Target element does not support checked state".to_string(),
+                "Use a checkbox or radio target",
+                true,
+                1,
+            ))
+        }
+    }
+
+    pub async fn select_node_value(
+        &self,
+        backend_node_id: u64,
+        value: &str,
+    ) -> Result<(), CliError> {
+        let selected = self
+            .call_node_function(
+                backend_node_id,
+                "function(nextValue) { if ((this.tagName || '').toLowerCase() !== 'select') return false; this.value = nextValue; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); return true; }",
+                vec![json!({ "value": value })],
+            )
+            .await?;
+        if selected.as_bool().unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(CliError::new(
+                crate::types::ErrorCode::ElementNotInteractive,
+                "Target element is not a <select>".to_string(),
+                "Use select on a select dropdown element",
+                true,
+                1,
+            ))
+        }
+    }
+
+    pub async fn upload_files(
+        &self,
+        backend_node_id: u64,
+        files: &[String],
+    ) -> Result<(), CliError> {
+        let _ = self
+            .call(
+                "DOM.setFileInputFiles",
+                json!({
+                    "backendNodeId": backend_node_id,
+                    "files": files
+                }),
+                CDP_TIMEOUT,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn print_to_pdf(&self) -> Result<String, CliError> {
+        let response = self
+            .call("Page.printToPDF", json!({}), Duration::from_millis(30_000))
+            .await?;
+        let data = response
+            .get("data")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| CliError::unknown("Page.printToPDF missing data", ""))?;
+        Ok(data.to_string())
+    }
+
+    pub async fn go_back(&self) -> Result<(), CliError> {
+        self.navigate_history(-1).await
+    }
+
+    pub async fn go_forward(&self) -> Result<(), CliError> {
+        self.navigate_history(1).await
+    }
+
+    pub async fn reload(&self) -> Result<(), CliError> {
+        let _ = self.call("Page.reload", json!({}), CDP_TIMEOUT).await?;
+        Ok(())
+    }
+
+    async fn navigate_history(&self, delta: i32) -> Result<(), CliError> {
+        let history = self
+            .call("Page.getNavigationHistory", json!({}), CDP_TIMEOUT)
+            .await?;
+        let current_index = history
+            .get("currentIndex")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| {
+                CliError::unknown("Page.getNavigationHistory missing currentIndex", "")
+            })?;
+        let entries = history
+            .get("entries")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| CliError::unknown("Page.getNavigationHistory missing entries", ""))?;
+
+        let target_index = current_index + i64::from(delta);
+        if target_index < 0 || target_index >= entries.len() as i64 {
+            return Err(CliError::bad_input(
+                "No navigation history entry for requested direction",
+                "Navigate to more pages before using back/forward",
+            ));
+        }
+
+        let entry_id = entries[target_index as usize]
+            .get("id")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| CliError::unknown("Navigation history entry missing id", ""))?;
+        let _ = self
+            .call(
+                "Page.navigateToHistoryEntry",
+                json!({ "entryId": entry_id }),
+                CDP_TIMEOUT,
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn press_key(&self, combo: &str) -> Result<(), CliError> {
@@ -1312,6 +1701,79 @@ impl PageClient {
                 true,
                 1,
             ))
+        }
+    }
+
+    pub async fn wait_for_function(
+        &self,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<(), CliError> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.eval_bool(expression).await.unwrap_or(false) {
+                return Ok(());
+            }
+            tokio::time::sleep(WAIT_POLL).await;
+        }
+
+        Err(CliError::new(
+            crate::types::ErrorCode::WaitTimeout,
+            "Timed out waiting for function condition".to_string(),
+            "Check the expression or increase --timeout-ms",
+            true,
+            1,
+        ))
+    }
+
+    pub async fn wait_for_load_state(
+        &self,
+        load_state: &str,
+        timeout: Duration,
+    ) -> Result<(), CliError> {
+        match load_state {
+            "load" | "domcontentloaded" => {
+                let deadline = Instant::now() + timeout;
+                while Instant::now() < deadline {
+                    let state = self.document_ready_state().await?;
+                    let ready = match load_state {
+                        "load" => matches!(state, DocumentReady::Complete),
+                        _ => matches!(state, DocumentReady::Interactive | DocumentReady::Complete),
+                    };
+                    if ready {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(WAIT_POLL).await;
+                }
+                Err(CliError::new(
+                    crate::types::ErrorCode::WaitTimeout,
+                    format!("Timed out waiting for load state '{}'", load_state),
+                    "Increase --timeout-ms or wait for page resources to settle",
+                    true,
+                    1,
+                ))
+            }
+            "networkidle" | "networkidle0" => self.wait_for_idle(timeout).await,
+            "networkidle2" => {
+                let ok = self
+                    .wait_for_network_idle(Duration::from_millis(500), 2, timeout)
+                    .await?;
+                if ok {
+                    Ok(())
+                } else {
+                    Err(CliError::new(
+                        crate::types::ErrorCode::WaitTimeout,
+                        "Timed out waiting for networkidle2".to_string(),
+                        "Increase --timeout-ms or loosen wait condition",
+                        true,
+                        1,
+                    ))
+                }
+            }
+            _ => Err(CliError::bad_input(
+                format!("Unsupported load state '{}'", load_state),
+                "Use one of: load, domcontentloaded, networkidle, networkidle2",
+            )),
         }
     }
 
@@ -2358,6 +2820,139 @@ fn collect_text_matches<'a>(
     for c in &node.children {
         collect_text_matches(c, needle, interactive_only, out);
     }
+}
+
+fn semantic_kind_name(kind: SemanticLocatorKind) -> &'static str {
+    match kind {
+        SemanticLocatorKind::Text => "text",
+        SemanticLocatorKind::Role => "role",
+        SemanticLocatorKind::Label => "label",
+        SemanticLocatorKind::Placeholder => "placeholder",
+        SemanticLocatorKind::AltText => "altText",
+        SemanticLocatorKind::Title => "title",
+        SemanticLocatorKind::TestId => "testId",
+    }
+}
+
+fn semantic_locator_expression(
+    kind: SemanticLocatorKind,
+    query: &str,
+    secondary: Option<&str>,
+    nth: Option<u32>,
+    count_only: bool,
+) -> Result<String, CliError> {
+    let kind_json = serde_json::to_string(semantic_kind_name(kind))
+        .map_err(|e| CliError::unknown(format!("Failed to encode locator kind: {}", e), ""))?;
+    let query_json = serde_json::to_string(query)
+        .map_err(|e| CliError::unknown(format!("Failed to encode locator query: {}", e), ""))?;
+    let secondary_json = serde_json::to_string(secondary.unwrap_or(""))
+        .map_err(|e| CliError::unknown(format!("Failed to encode locator secondary: {}", e), ""))?;
+    let index = nth.unwrap_or(0);
+
+    let tail = if count_only {
+        "return matches.length;".to_string()
+    } else {
+        format!("return matches[{}] || null;", index)
+    };
+
+    Ok(format!(
+        r#"(() => {{
+  const kind = {kind};
+  const query = ({query} || "").trim();
+  const secondary = ({secondary} || "").trim();
+  if (!query && kind !== "role") return {empty_return};
+  const lowerQuery = query.toLowerCase();
+  const lowerSecondary = secondary.toLowerCase();
+  const all = Array.from(document.querySelectorAll("*"));
+
+  const textOf = (el) => {{
+    const aria = (el.getAttribute("aria-label") || "").trim();
+    const txt = (el.innerText || el.textContent || "").trim();
+    const val = (el.value || "").toString().trim();
+    return [aria, txt, val].find((v) => !!v) || "";
+  }};
+
+  const roleOf = (el) => {{
+    const explicit = (el.getAttribute("role") || "").trim().toLowerCase();
+    if (explicit) return explicit;
+    const tag = (el.tagName || "").toLowerCase();
+    if (tag === "a") return "link";
+    if (tag === "button") return "button";
+    if (tag === "input") {{
+      const t = (el.getAttribute("type") || "text").toLowerCase();
+      if (t === "checkbox") return "checkbox";
+      if (t === "radio") return "radio";
+      return "textbox";
+    }}
+    return tag;
+  }};
+
+  const nameMatches = (value, needle) => value.toLowerCase().includes(needle);
+  const byText = () => all.filter((el) => nameMatches(textOf(el), lowerQuery));
+  const byRole = () => all.filter((el) => {{
+    if (roleOf(el) !== lowerQuery) return false;
+    if (!lowerSecondary) return true;
+    return nameMatches(textOf(el), lowerSecondary);
+  }});
+  const byLabel = () => {{
+    const labels = Array.from(document.querySelectorAll("label"));
+    const matches = [];
+    for (const label of labels) {{
+      const txt = (label.innerText || label.textContent || "").toLowerCase();
+      if (!txt.includes(lowerQuery)) continue;
+      if (label.control) matches.push(label.control);
+      const forAttr = label.getAttribute("for");
+      if (forAttr) {{
+        const target = document.getElementById(forAttr);
+        if (target) matches.push(target);
+      }}
+    }}
+    return matches;
+  }};
+  const byPlaceholder = () => all.filter((el) => (el.getAttribute("placeholder") || "").toLowerCase().includes(lowerQuery));
+  const byAltText = () => all.filter((el) => (el.getAttribute("alt") || "").toLowerCase().includes(lowerQuery));
+  const byTitle = () => all.filter((el) => (el.getAttribute("title") || "").toLowerCase().includes(lowerQuery));
+  const byTestId = () => all.filter((el) => {{
+    const value = (el.getAttribute("data-testid") || el.getAttribute("data-test-id") || "").toLowerCase();
+    return value === lowerQuery || value.includes(lowerQuery);
+  }});
+
+  let matches = [];
+  switch (kind) {{
+    case "text":
+      matches = byText();
+      break;
+    case "role":
+      matches = byRole();
+      break;
+    case "label":
+      matches = byLabel();
+      break;
+    case "placeholder":
+      matches = byPlaceholder();
+      break;
+    case "altText":
+      matches = byAltText();
+      break;
+    case "title":
+      matches = byTitle();
+      break;
+    case "testId":
+      matches = byTestId();
+      break;
+    default:
+      matches = [];
+  }}
+
+  matches = matches.filter((el, idx) => el && matches.indexOf(el) === idx);
+  {tail}
+}})()"#,
+        kind = kind_json,
+        query = query_json,
+        secondary = secondary_json,
+        empty_return = if count_only { "0" } else { "null" },
+        tail = tail
+    ))
 }
 
 // --- CDP error mapping ---

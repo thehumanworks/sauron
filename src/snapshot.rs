@@ -225,9 +225,59 @@ fn serialize_node(
     role_indices: &mut HashMap<String, u32>,
 ) {
     let is_interactive = is_interactive_role(&node.role);
+    let role_lower = node.role.to_ascii_lowercase();
+    let scoped_match = opts
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|scope| {
+            let scope_lower = scope.to_ascii_lowercase();
+            role_lower.contains(&scope_lower)
+                || node
+                    .name
+                    .as_deref()
+                    .map(|name| name.to_ascii_lowercase().contains(&scope_lower))
+                    .unwrap_or(false)
+        })
+        .unwrap_or(true);
 
     // interactive-only mode: skip non-interactive nodes but recurse into children at the same depth
     if opts.interactive && !is_interactive {
+        for child in &node.children {
+            serialize_node(
+                child,
+                depth,
+                opts,
+                refs,
+                lines,
+                counter,
+                role_counts,
+                role_indices,
+            );
+        }
+        return;
+    }
+    // clickable mode narrows output to actionable nodes while preserving traversal.
+    if opts.clickable && !is_interactive {
+        for child in &node.children {
+            serialize_node(
+                child,
+                depth,
+                opts,
+                refs,
+                lines,
+                counter,
+                role_counts,
+                role_indices,
+            );
+        }
+        return;
+    }
+    if !opts.include_iframes && role_lower.contains("iframe") {
+        return;
+    }
+    if !scoped_match {
         for child in &node.children {
             serialize_node(
                 child,
