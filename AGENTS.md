@@ -39,7 +39,7 @@ flowchart LR
 ## Build, Test, and Development Commands
 - `cargo run -- --help`: run CLI locally and inspect command surface.
 - `cargo check`: fast compile validation during iteration.
-- `cargo test`: run unit tests (`#[cfg(test)]` modules).
+- `cargo test`: run unit tests (`#[cfg(test)]` modules) and integration tests under `tests/`.
 - `cargo clippy --all-targets --all-features -- -D warnings`: enforce lint-clean code.
 - `cargo build --release`: produce optimized binary used for final verification.
 - `node scripts/release-version.mjs current`: confirm Cargo/npm release versions are synchronized.
@@ -59,6 +59,7 @@ Prefer small, focused functions and explicit error mapping via `CliError`. Keep 
 ## Testing Guidelines
 Tests are currently module-local (for example in `src/context.rs`, `src/runtime.rs`). Add tests near modified logic.  
 For code touching environment variables in tests, reuse shared locking (`src/test_support.rs`) to avoid cross-test races.  
+When a task changes a multi-step workflow, add an integration test that executes the full sequential chain end to end. This is required for workflow changes because it validates command ordering and catches regressions that only appear across subprocess or concurrency boundaries.  
 At minimum, cover:
 - lifecycle transitions (`runtime start`/`runtime stop`),
 - session lookup/validation behavior,

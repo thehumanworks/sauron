@@ -72,7 +72,7 @@ The `sauron` launcher inside the package selects the matching binary for the cur
 
 ## Quick start
 
-Each shell/process must start a runtime session first:
+Start a runtime session before browser commands:
 
 ```bash
 sauron runtime start
@@ -80,7 +80,7 @@ sauron runtime start
 
 macOS defaults to GPU + WebGL on `runtime start` (opt out with `--no-webgl --no-gpu`).
 
-Then run browser commands from the same project directory:
+Then run browser commands from the same project directory. Later `sauron` invocations can reuse that session from separate subprocesses in the same shell or agent workflow:
 
 ```bash
 sauron page goto https://example.com
@@ -97,13 +97,13 @@ sauron runtime stop
 
 ## Mandatory session lifecycle
 
-- Non-`runtime start` commands require an active runtime session.
+- Most non-`runtime start` commands require an active runtime session. `runtime status` is the exception: it can also report `stopped` when no active session exists.
 - Session resolution order is:
   - explicit `--session-id`
   - current process binding
   - current project binding
   - `SAURON_SESSION_ID` fallback
-- If none resolve to an active session, commands fail with `SESSION_REQUIRED`.
+- If none resolve to an active session, commands that need one fail with `SESSION_REQUIRED`.
 - `start` auto-generates:
   - `session_id` (`sess-...`)
   - `instance` (`inst-...`)
@@ -179,6 +179,7 @@ unset SAURON_SESSION_ID
 ## Runtime state
 
 Runtime session state is stored on the local filesystem under `~/.sauron/runtime/`.
+After `runtime stop` or `runtime cleanup`, `sauron runtime status` reports `stopped`.
 
 ## Session logs
 

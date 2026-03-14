@@ -27,7 +27,7 @@ use runtime::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 
@@ -544,6 +544,17 @@ struct ActiveRuntime {
     ctx: AppContext,
 }
 
+enum RuntimeStatusTarget {
+    Runtime(Box<ActiveRuntime>),
+    Probe(RuntimeStatusProbe),
+    Missing,
+}
+
+struct RuntimeStatusProbe {
+    pid_path: PathBuf,
+    port: u16,
+}
+
 fn build_runtime_store() -> Result<RuntimeStore, CliError> {
     RuntimeStore::new()
 }
@@ -564,6 +575,156 @@ fn require_runtime(
         session,
         ctx,
     })
+}
+
+fn is_session_resolution_error(error: &CliError) -> bool {
+    matches!(
+        error.code,
+        types::ErrorCode::SessionRequired
+            | types::ErrorCode::SessionInvalid
+            | types::ErrorCode::SessionTerminated
+    )
+}
+
+fn build_runtime_status_probe(
+    instance: Option<String>,
+    client: Option<String>,
+    pid_path: Option<PathBuf>,
+    user_data_dir: Option<PathBuf>,
+    port: Option<u16>,
+) -> Result<Option<RuntimeStatusProbe>, CliError> {
+    if let Some(pid_path) = pid_path {
+        return Ok(Some(RuntimeStatusProbe {
+            pid_path,
+            port: port.unwrap_or(9222),
+        }));
+    }
+
+    if instance.is_some() || client.is_some() || user_data_dir.is_some() {
+        let ctx = AppContext::new(
+            instance.as_deref().unwrap_or("default"),
+            client.as_deref().unwrap_or("default"),
+            None,
+            user_data_dir,
+        )?;
+        let port = ctx.resolve_port(port);
+        return Ok(Some(RuntimeStatusProbe {
+            pid_path: ctx.pid_path,
+            port,
+        }));
+    }
+
+    if let Some(port) = port {
+        return Ok(Some(RuntimeStatusProbe {
+            pid_path: context::resolve_base_dir()?
+                .join("runtime")
+                .join(".status-probe.pid"),
+            port,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn resolve_runtime_status_target(
+    store: &RuntimeStore,
+    session_id: Option<String>,
+    instance: Option<String>,
+    client: Option<String>,
+    pid_path: Option<PathBuf>,
+    user_data_dir: Option<PathBuf>,
+    port: Option<u16>,
+) -> Result<RuntimeStatusTarget, CliError> {
+    match require_runtime(store, session_id) {
+        Ok(runtime) => Ok(RuntimeStatusTarget::Runtime(Box::new(runtime))),
+        Err(error) if is_session_resolution_error(&error) => {
+            let Some(probe) =
+                build_runtime_status_probe(instance, client, pid_path, user_data_dir, port)?
+            else {
+                return Ok(RuntimeStatusTarget::Missing);
+            };
+            Ok(RuntimeStatusTarget::Probe(probe))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn status_payload_from_daemon_status(status: types::DaemonStatus) -> serde_json::Value {
+    match status {
+        types::DaemonStatus::Running { pid, port, ws_url } => json!({
+            "status": "running",
+            "pid": pid,
+            "port": port,
+            "wsUrl": ws_url
+        }),
+        types::DaemonStatus::Stale { pid, port } => json!({
+            "status": "stale",
+            "pid": pid,
+            "port": port,
+            "hint": "Run 'sauron runtime stop' then 'sauron runtime start'"
+        }),
+        types::DaemonStatus::Stopped => json!({
+            "status": "stopped"
+        }),
+    }
+}
+
+fn remove_file_if_present(path: &Path, what: &str) -> Result<(), CliError> {
+    match std::fs::remove_file(path) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(CliError::unknown(
+                    format!("Failed to remove {} {}: {}", what, path.display(), e),
+                    "Check filesystem permissions",
+                ))
+            }
+        }
+    }
+}
+
+fn remove_dir_all_if_present(path: &Path, what: &str) -> Result<(), CliError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(CliError::unknown(
+                    format!("Failed to remove {} {}: {}", what, path.display(), e),
+                    "Check filesystem permissions",
+                ))
+            }
+        }
+    }
+}
+
+fn remove_dir_if_empty(path: &Path, what: &str) -> Result<(), CliError> {
+    match std::fs::remove_dir(path) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+            {
+                Ok(())
+            } else {
+                Err(CliError::unknown(
+                    format!("Failed to remove {} {}: {}", what, path.display(), e),
+                    "Check filesystem permissions",
+                ))
+            }
+        }
+    }
+}
+
+fn cleanup_runtime_context(ctx: &AppContext) -> Result<(), CliError> {
+    context::remove_pid_file(&ctx.pid_path)?;
+    remove_dir_all_if_present(&ctx.user_data_dir, "Chrome user data dir")?;
+    remove_file_if_present(&ctx.instance_lock_path, "instance lock")?;
+    remove_dir_if_empty(&ctx.instance_dir, "instance dir")?;
+    Ok(())
 }
 
 fn begin_runtime_command(runtime: &mut ActiveRuntime, command_name: &str) -> Result<(), CliError> {
@@ -1018,6 +1179,8 @@ async fn main() {
                     Ok(c) => c,
                     Err(e) => exit_with_error(command_name, e),
                 };
+                session.pid_path = Some(ctx.pid_path.clone());
+                session.user_data_dir = Some(ctx.user_data_dir.clone());
 
                 let timeout_ms = timeout_ms_flag.unwrap_or(10_000);
                 let webgl_enabled = if webgl {
@@ -1169,27 +1332,8 @@ async fn main() {
                 if let Err(e) = cleanup_session_state(&runtime.ctx.base_dir, &runtime.session) {
                     terminate_errors.push(e.message);
                 }
-                if let Some(pid_path) = &runtime.session.pid_path {
-                    if let Err(e) = context::remove_pid_file(pid_path) {
-                        terminate_errors.push(e.message);
-                    }
-                }
-                if let Some(user_data_dir) = &runtime.session.user_data_dir {
-                    if let Err(e) = std::fs::remove_dir_all(user_data_dir) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            terminate_errors.push(
-                                CliError::unknown(
-                                    format!(
-                                        "Failed to remove custom Chrome user data dir {}: {}",
-                                        user_data_dir.display(),
-                                        e
-                                    ),
-                                    "Check filesystem permissions",
-                                )
-                                .message,
-                            );
-                        }
-                    }
+                if let Err(e) = cleanup_runtime_context(&runtime.ctx) {
+                    terminate_errors.push(e.message);
                 }
 
                 if !terminate_errors.is_empty() {
@@ -1228,37 +1372,46 @@ async fn main() {
             RuntimeCommands::Status => {
                 let started_at = Instant::now();
                 let command_name = "runtime.status";
-                let mut runtime =
-                    ensure_runtime_or_exit(&store, session_id_flag.clone(), command_name);
-                if let Err(e) = begin_runtime_command(&mut runtime, command_name) {
-                    exit_with_error(command_name, e);
-                }
-
-                let port = runtime.ctx.resolve_port(port_flag);
-                let status_payload = match daemon::get_status(&runtime.ctx.pid_path, port).await {
-                    types::DaemonStatus::Running { pid, port, ws_url } => json!({
-                        "status": "running",
-                        "pid": pid,
-                        "port": port,
-                        "wsUrl": ws_url
-                    }),
-                    types::DaemonStatus::Stale { pid, port } => json!({
-                        "status": "stale",
-                        "pid": pid,
-                        "port": port,
-                        "hint": "Run 'sauron runtime stop' then 'sauron runtime start'"
-                    }),
-                    types::DaemonStatus::Stopped => json!({
-                        "status": "stopped"
-                    }),
+                let status_target = match resolve_runtime_status_target(
+                    &store,
+                    session_id_flag.clone(),
+                    instance_flag.clone(),
+                    client_flag.clone(),
+                    pid_path_flag.clone(),
+                    user_data_dir_flag.clone(),
+                    port_flag,
+                ) {
+                    Ok(target) => target,
+                    Err(e) => exit_with_error(command_name, e),
                 };
-                finish_runtime_command(
-                    &runtime,
-                    command_name,
-                    true,
-                    json!({ "status": status_payload["status"] }),
-                );
-                let meta = build_response_meta(Some(&runtime), started_at);
+
+                let (runtime, status_payload) = match status_target {
+                    RuntimeStatusTarget::Runtime(mut runtime) => {
+                        if let Err(e) = begin_runtime_command(&mut runtime, command_name) {
+                            exit_with_error(command_name, e);
+                        }
+
+                        let port = runtime.ctx.resolve_port(port_flag);
+                        let status_payload = status_payload_from_daemon_status(
+                            daemon::get_status(&runtime.ctx.pid_path, port).await,
+                        );
+                        finish_runtime_command(
+                            &runtime,
+                            command_name,
+                            true,
+                            json!({ "status": status_payload["status"] }),
+                        );
+                        (Some(*runtime), status_payload)
+                    }
+                    RuntimeStatusTarget::Probe(probe) => {
+                        let status_payload = status_payload_from_daemon_status(
+                            daemon::get_status(&probe.pid_path, probe.port).await,
+                        );
+                        (None, status_payload)
+                    }
+                    RuntimeStatusTarget::Missing => (None, json!({ "status": "stopped" })),
+                };
+                let meta = build_response_meta(runtime.as_ref(), started_at);
                 print_result(&make_success_with_meta(command_name, status_payload, meta));
             }
             RuntimeCommands::Cleanup => {
@@ -3269,6 +3422,16 @@ async fn with_browser_only_command<F, Fut, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_home() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sauron-main-test-{}", nanos))
+    }
 
     #[test]
     fn command_labels_are_namespaced() {
@@ -3332,5 +3495,51 @@ mod tests {
     fn parse_viewport_rejects_zero_dimension() {
         let err = parse_viewport("0x900").expect_err("viewport should fail");
         assert!(matches!(err.code, types::ErrorCode::BadInput));
+    }
+
+    #[test]
+    fn resolve_runtime_status_target_is_missing_when_no_session_or_probe_exists() {
+        let _guard = ENV_LOCK.lock().expect("lock poisoned");
+        let home = unique_test_home();
+        std::env::set_var("SAURON_HOME", &home);
+
+        let store = build_runtime_store().expect("store should initialize");
+        let target = resolve_runtime_status_target(&store, None, None, None, None, None, None)
+            .expect("status target should resolve");
+
+        assert!(matches!(target, RuntimeStatusTarget::Missing));
+
+        std::env::remove_var("SAURON_HOME");
+    }
+
+    #[test]
+    fn cleanup_runtime_context_removes_default_runtime_artifacts() {
+        let _guard = ENV_LOCK.lock().expect("lock poisoned");
+        let home = unique_test_home();
+        std::env::set_var("SAURON_HOME", &home);
+
+        let ctx = AppContext::new("inst-clean", "client-clean", None, None)
+            .expect("context should build");
+        std::fs::create_dir_all(&ctx.user_data_dir).expect("user data dir should exist");
+        std::fs::write(&ctx.instance_lock_path, b"").expect("instance lock should exist");
+        context::write_pid_file(
+            &ctx.pid_path,
+            &types::PidFileData {
+                pid: 12345,
+                port: 9222,
+                xvfb_pid: None,
+                display: None,
+            },
+        )
+        .expect("pidfile should exist");
+
+        cleanup_runtime_context(&ctx).expect("cleanup should succeed");
+
+        assert!(!ctx.pid_path.exists());
+        assert!(!ctx.user_data_dir.exists());
+        assert!(!ctx.instance_lock_path.exists());
+        assert!(!ctx.instance_dir.exists());
+
+        std::env::remove_var("SAURON_HOME");
     }
 }

@@ -282,6 +282,37 @@ fn port_is_bindable(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
+fn configure_background_process(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // Agent runners often reap the launching command's process group as soon as the
+        // command exits. Start Chrome in its own session so it survives one-shot invocations.
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid().map(|_| ()).map_err(|err| {
+                    std::io::Error::other(format!(
+                        "failed to detach Chrome child into a new session: {}",
+                        err
+                    ))
+                })
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+}
+
 fn pick_free_port(preferred: Option<u16>) -> u16 {
     if let Some(p) = preferred {
         if port_is_bindable(p) {
@@ -431,13 +462,7 @@ pub async fn start(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    configure_background_process(&mut cmd);
 
     let child = cmd.spawn().map_err(|e| {
         CliError::unknown(
@@ -599,6 +624,8 @@ pub async fn stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use nix::unistd::{getpgid, getsid, Pid};
 
     fn launch_opts(headless: bool) -> ChromeLaunchOptions {
         ChromeLaunchOptions {
@@ -664,5 +691,30 @@ mod tests {
 
         assert!(!args.iter().any(|arg| arg == "--enable-webgl"));
         assert!(!args.iter().any(|arg| arg == "--use-angle=swiftshader"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_background_process_creates_a_new_session() {
+        let parent_sid = getsid(None).expect("parent sid should resolve");
+
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_background_process(&mut cmd);
+
+        let mut child = cmd.spawn().expect("child should spawn");
+        let child_pid = Pid::from_raw(child.id() as i32);
+        let child_sid = getsid(Some(child_pid)).expect("child sid should resolve");
+        let child_pgid = getpgid(Some(child_pid)).expect("child pgid should resolve");
+
+        assert_ne!(child_sid, parent_sid);
+        assert_eq!(child_sid.as_raw(), child.id() as i32);
+        assert_eq!(child_pgid.as_raw(), child.id() as i32);
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
