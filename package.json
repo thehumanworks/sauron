@@ -1,6 +1,6 @@
 {
   "name": "@nothumanwork/sauron",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Rust-native CLI for controlling Chrome via CDP",
   "license": "MIT",
   "homepage": "https://github.com/thehumanworks/sauron#readme",
